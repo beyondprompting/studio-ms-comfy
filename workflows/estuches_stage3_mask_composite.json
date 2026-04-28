@@ -1,0 +1,78 @@
+{
+  "1": {
+    "inputs": {
+      "image": "REPLACE_CROP_IMAGE.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": "REPLACE_PRODUCT_NOBG.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "3": {
+    "inputs": {
+      "image": "REPLACE_COMBINED_MASK.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "4": {
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": [
+        "1",
+        0
+      ],
+      "source": [
+        "2",
+        0
+      ],
+      "mask": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {
+      "title": "ImageCompositeMasked"
+    }
+  },
+  "5": {
+    "inputs": {
+      "filename_prefix": "estuches/composite_display",
+      "images": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  },
+  "6": {
+    "inputs": {
+      "filename_prefix": "estuches/composite_silhouette",
+      "images": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  }
+}

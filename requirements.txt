@@ -1,0 +1,8 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+websockets==15.0.1
+requests==2.32.3
+websocket-client==1.8.0
+python-multipart==0.0.20
+convex==0.7.0
+Pillow==11.2.1

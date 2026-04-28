@@ -1,0 +1,33 @@
+{
+  "1": {
+    "inputs": {
+      "image": "__INPUT_IMAGE__"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "2": {
+    "inputs": {
+      "filename_prefix": "__FILENAME_PREFIX__",
+      "images": ["3", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  },
+  "3": {
+    "inputs": {
+      "resize_type": "scale longer dimension",
+      "resize_type.longer_size": "__WIDTH__",
+      "scale_method": "area",
+      "input": ["1", 0]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Redimensionar Imagen/Máscara"
+    }
+  }
+}

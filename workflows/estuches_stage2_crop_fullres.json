@@ -1,0 +1,34 @@
+{
+  "1": {
+    "inputs": {
+      "image": "__INPUT_IMAGE__"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "2": {
+    "inputs": {
+      "x": "__CROP_X__",
+      "y": "__CROP_Y__",
+      "width": "__CROP_WIDTH__",
+      "height": "__CROP_HEIGHT__",
+      "image": ["1", 0]
+    },
+    "class_type": "ImageCrop",
+    "_meta": {
+      "title": "Recorte de Imagen"
+    }
+  },
+  "3": {
+    "inputs": {
+      "filename_prefix": "__FILENAME_PREFIX__",
+      "images": ["2", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  }
+}

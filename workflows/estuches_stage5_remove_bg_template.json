@@ -1,0 +1,58 @@
+{
+  "1": {
+    "inputs": {
+      "image": "REPLACE_PRODUCT_INPUT.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "2": {
+    "inputs": {
+      "resize_type": "scale longer dimension",
+      "resize_type.longer_size": 1024,
+      "scale_method": "area",
+      "input": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Redimensionar Imagen/Máscara"
+    }
+  },
+  "3": {
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": [
+        "2",
+        0
+      ],
+      "source": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {
+      "title": "ImageCompositeMasked"
+    }
+  },
+  "4": {
+    "inputs": {
+      "filename_prefix": "estuches/remove_bg_result",
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  }
+}

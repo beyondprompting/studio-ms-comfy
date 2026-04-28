@@ -1,0 +1,76 @@
+{
+  "1": {
+    "inputs": {
+      "image": "REPLACE_BACKGROUND_ORIGINAL.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": "REPLACE_QWEN_RESULT.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "3": {
+    "inputs": {
+      "image": "REPLACE_COMBINED_MASK.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Cargar Imagen"
+    }
+  },
+  "4": {
+    "inputs": {
+      "resize_type": "scale longer dimension",
+      "resize_type.longer_size": 1024,
+      "scale_method": "area",
+      "input": [
+        "2",
+        1
+      ]
+    },
+    "class_type": "ResizeImageMaskNode",
+    "_meta": {
+      "title": "Redimensionar Imagen/Máscara"
+    }
+  },
+  "5": {
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": [
+        "2",
+        0
+      ],
+      "mask": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {
+      "title": "ImageCompositeMasked"
+    }
+  },
+  "6": {
+    "inputs": {
+      "filename_prefix": "estuches/reimplanted",
+      "images": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Guardar Imagen"
+    }
+  }
+}

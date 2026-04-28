@@ -1,0 +1,13 @@
+# Local Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime output
+output/
+
+# Worker secrets / local env files
+.env.worker.dev
+.env.worker.prod
+.env.worker
+.env.*
