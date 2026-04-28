@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +18,14 @@ from .workflow import build_workflow, load_workflow_template
 
 class ConvexPullWorker:
     _THUMB_MAX_SIZE = 600
+    _CRITICAL_COMFY_WS_TYPES = {
+        "execution_start",
+        "execution_success",
+        "execution_error",
+        "execution_cached",
+        "executing",
+        "executed",
+    }
 
     def __init__(self) -> None:
         self._convex = ConvexBridge(
@@ -35,7 +44,73 @@ class ConvexPullWorker:
         self._default_workflow_key = settings.workflow_default_key
         if self._default_workflow_key not in self._templates:
             self._default_workflow_key = next(iter(self._templates))
+        self._source_image_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+        self._ws_event_counters: dict[str, int] = {}
         self._running = False
+
+    def _purge_source_cache(self, now: float) -> None:
+        ttl = max(settings.worker_source_cache_ttl_seconds, 0)
+        if ttl == 0:
+            self._source_image_cache.clear()
+            return
+
+        expired_keys = [
+            key
+            for key, (fetched_at, _data) in self._source_image_cache.items()
+            if now - fetched_at > ttl
+        ]
+        for key in expired_keys:
+            self._source_image_cache.pop(key, None)
+
+        max_entries = max(settings.worker_source_cache_max_entries, 1)
+        while len(self._source_image_cache) > max_entries:
+            self._source_image_cache.popitem(last=False)
+
+    def _get_source_image_bytes(self, source_url: str) -> tuple[bytes, bool]:
+        if not settings.worker_source_cache_enabled:
+            response = requests.get(source_url, timeout=120)
+            response.raise_for_status()
+            return response.content, False
+
+        now = time.time()
+        self._purge_source_cache(now)
+
+        cached = self._source_image_cache.get(source_url)
+        if cached is not None:
+            fetched_at, cached_bytes = cached
+            self._source_image_cache.move_to_end(source_url)
+            if now - fetched_at <= max(settings.worker_source_cache_ttl_seconds, 0):
+                return cached_bytes, True
+            self._source_image_cache.pop(source_url, None)
+
+        response = requests.get(source_url, timeout=120)
+        response.raise_for_status()
+        data = response.content
+
+        self._source_image_cache[source_url] = (now, data)
+        self._source_image_cache.move_to_end(source_url)
+        self._purge_source_cache(now)
+        return data, False
+
+    def _should_emit_comfy_event(self, job_id: str, event: dict[str, Any]) -> bool:
+        if settings.worker_emit_all_comfy_events:
+            return True
+
+        event_type = event.get("type")
+        if event_type != "comfy_ws_message":
+            return True
+
+        message_type = event.get("message_type")
+        if message_type in self._CRITICAL_COMFY_WS_TYPES:
+            return True
+
+        sample_every = max(settings.worker_ws_event_sample_every, 1)
+        counter = self._ws_event_counters.get(job_id, 0) + 1
+        self._ws_event_counters[job_id] = counter
+
+        if counter == 1:
+            return True
+        return counter % sample_every == 0
 
     def _build_workflow_paths(self) -> dict[str, str]:
         if settings.workflow_templates_json.strip():
@@ -214,6 +289,7 @@ class ConvexPullWorker:
             print(f"[worker] append_event failed for {job_id}: {exc}")
 
     def _process_claimed_job(self, job: ClaimedJob) -> None:
+        self._ws_event_counters[job.job_id] = 0
         self._emit_event(
             job.job_id,
             {
@@ -224,9 +300,7 @@ class ConvexPullWorker:
         )
 
         try:
-            response = requests.get(job.source_image_url, timeout=120)
-            response.raise_for_status()
-            input_bytes = response.content
+            input_bytes, cache_hit = self._get_source_image_bytes(job.source_image_url)
 
             source_width: int | None = None
             source_height: int | None = None
@@ -243,6 +317,7 @@ class ConvexPullWorker:
                     "type": "input_downloaded",
                     "contentLength": len(input_bytes),
                     "source": job.source_image_url,
+                    "sourceCacheHit": cache_hit,
                     "sourceWidth": source_width,
                     "sourceHeight": source_height,
                 },
@@ -319,6 +394,8 @@ class ConvexPullWorker:
 
             def relay_event(event: dict[str, Any]) -> None:
                 # This callback is called from blocking Comfy execution context.
+                if not self._should_emit_comfy_event(job.job_id, event):
+                    return
                 self._emit_event(job.job_id, event)
 
             comfy_result = self._comfy.run_prompt_and_get_first_image(
@@ -331,6 +408,62 @@ class ConvexPullWorker:
                 content_type="image/png",
                 generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
             )
+
+            if workflow_key == "estuches_stage2_crop_fullres":
+                fast_result_payload = {
+                    "promptId": comfy_result.prompt_id,
+                    "filename": comfy_result.output_filename,
+                    "subfolder": comfy_result.output_subfolder,
+                    "type": comfy_result.output_type,
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "thumbnailStorageId": None,
+                }
+
+                # Stage 2 UX path: unblock frontend as soon as crop PNG is uploaded.
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=upload["storageId"],
+                    result=fast_result_payload,
+                )
+                self._emit_event(job.job_id, {"type": "job_completed", "resultStorageId": upload["storageId"]})
+
+                thumb_path = self._create_thumbnail_file(
+                    source_path=comfy_result.output_file_path,
+                    job_id=job.job_id,
+                )
+                if thumb_path:
+                    try:
+                        thumb_upload = self._convex.upload_file_to_convex(
+                            file_path=str(thumb_path),
+                            content_type="image/jpeg",
+                            generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                        )
+                        self._emit_event(
+                            job.job_id,
+                            {
+                                "type": "thumbnail_uploaded",
+                                "thumbnailStorageId": thumb_upload["storageId"],
+                            },
+                        )
+                        try:
+                            self._convex.mutation(
+                                settings.convex_attach_stage2_thumbnail_mutation,
+                                {
+                                    "jobId": job.job_id,
+                                    "thumbnailStorageId": thumb_upload["storageId"],
+                                },
+                            )
+                        except Exception as attach_exc:  # noqa: BLE001
+                            print(f"[worker] stage2 thumbnail attach failed for {job.job_id}: {attach_exc}")
+                    finally:
+                        try:
+                            thumb_path.unlink(missing_ok=True)
+                        except Exception as cleanup_exc:  # noqa: BLE001
+                            print(f"[worker] thumbnail cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                return
 
             thumb_upload = None
             thumb_path = self._create_thumbnail_file(
@@ -383,6 +516,8 @@ class ConvexPullWorker:
                 self._convex.mark_job_failed(settings.convex_mark_failed_mutation, job.job_id, err)
             finally:
                 self._emit_event(job.job_id, {"type": "job_failed", "error": err})
+        finally:
+            self._ws_event_counters.pop(job.job_id, None)
 
     def _create_thumbnail_file(self, source_path: str, job_id: str) -> Path | None:
         try:

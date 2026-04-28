@@ -40,6 +40,14 @@ class Settings:
     convex_generate_upload_url_mutation: str = os.getenv(
         "CONVEX_GENERATE_UPLOAD_URL_MUTATION", "files:generateUploadUrl"
     )
+    convex_attach_stage2_thumbnail_mutation: str = os.getenv(
+        "CONVEX_ATTACH_STAGE2_THUMBNAIL_MUTATION", "comfyJobs:attachStage2Thumbnail"
+    )
+    worker_source_cache_enabled: bool = os.getenv("WORKER_SOURCE_CACHE_ENABLED", "true").lower() == "true"
+    worker_source_cache_ttl_seconds: float = float(os.getenv("WORKER_SOURCE_CACHE_TTL_SECONDS", "300"))
+    worker_source_cache_max_entries: int = int(os.getenv("WORKER_SOURCE_CACHE_MAX_ENTRIES", "8"))
+    worker_emit_all_comfy_events: bool = os.getenv("WORKER_EMIT_ALL_COMFY_EVENTS", "false").lower() == "true"
+    worker_ws_event_sample_every: int = int(os.getenv("WORKER_WS_EVENT_SAMPLE_EVERY", "8"))
 
 
 settings = Settings()
