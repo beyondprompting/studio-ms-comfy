@@ -1,13 +1,61 @@
-# Local Python environment
-.venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
+*.py[codz]
+*$py.class
 
-# Runtime output
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Test/cache/tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache
+
+# Logs/runtime
+*.log
+*.pid
 output/
 
-# Worker secrets / local env files
-.env.worker.dev
-.env.worker.prod
-.env.worker
+# Local secrets/env
+.env
 .env.*
+.envrc
+
+# Notebook/editor
+.ipynb_checkpoints
+tempCodeRunnerFile.py
