@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from .comfy_client import ComfyClient
 from .config import settings
@@ -111,6 +113,190 @@ class ConvexPullWorker:
         if counter == 1:
             return True
         return counter % sample_every == 0
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
+    def _download_image_rgba(self, url: str, timeout: int = 120) -> Image.Image:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        with Image.open(BytesIO(response.content)) as img:
+            return img.convert("RGBA")
+
+    def _process_stage4_reimplant(
+        self,
+        job: ClaimedJob,
+        background_bytes: bytes,
+    ) -> tuple[Path, int, int, dict[str, int]]:
+        t0 = time.perf_counter()
+        params = job.params if isinstance(job.params, dict) else {}
+        qwen_result_url = params.get("qwenResultUrl") if isinstance(params.get("qwenResultUrl"), str) else None
+        mask_url = params.get("maskUrl") if isinstance(params.get("maskUrl"), str) else None
+        thumbnail_max_size = self._safe_int(params.get("thumbnailMaxSize")) or 600
+
+        if not qwen_result_url or not mask_url:
+            raise RuntimeError("Stage 4 missing required params: qwenResultUrl or maskUrl")
+
+        with Image.open(BytesIO(background_bytes)) as bg_raw:
+            bg_img = bg_raw.convert("RGBA")
+        load_background_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        def _timed_download(url: str) -> tuple[Image.Image, int]:
+            t_start = time.perf_counter()
+            img = self._download_image_rgba(url)
+            elapsed_ms = int(round((time.perf_counter() - t_start) * 1000))
+            return img, elapsed_ms
+
+        # Download independent inputs in parallel to reduce Stage4 wall time.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            qwen_future = executor.submit(_timed_download, qwen_result_url)
+            mask_future = executor.submit(_timed_download, mask_url)
+            qwen_img, download_qwen_ms = qwen_future.result()
+            mask_img, download_mask_ms = mask_future.result()
+
+        crop_region = job.crop_region if isinstance(job.crop_region, dict) else {}
+        crop_x_thumb = self._safe_float(crop_region.get("x"))
+        crop_y_thumb = self._safe_float(crop_region.get("y"))
+        crop_w_thumb = self._safe_float(crop_region.get("width"))
+        crop_h_thumb = self._safe_float(crop_region.get("height"))
+        thumb_canvas_w = self._safe_float(crop_region.get("thumbnailCanvasWidth"))
+        thumb_canvas_h = self._safe_float(crop_region.get("thumbnailCanvasHeight"))
+        rotation = self._safe_float(crop_region.get("rotation")) or 0.0
+
+        if (
+            crop_x_thumb is None
+            or crop_y_thumb is None
+            or crop_w_thumb is None
+            or crop_h_thumb is None
+        ):
+            raise RuntimeError("Stage 4 missing cropRegion x/y/width/height")
+
+        bg_w, bg_h = bg_img.width, bg_img.height
+        if (
+            thumb_canvas_w is not None
+            and thumb_canvas_h is not None
+            and thumb_canvas_w > 0
+            and thumb_canvas_h > 0
+        ):
+            ratio_x = bg_w / thumb_canvas_w
+            ratio_y = bg_h / thumb_canvas_h
+        else:
+            # Legacy fallback for older jobs that only send thumbnailMaxSize.
+            thumb_scale = min(1.0, thumbnail_max_size / bg_w, thumbnail_max_size / bg_h)
+            thumb_w = max(1, int(round(bg_w * thumb_scale)))
+            thumb_h = max(1, int(round(bg_h * thumb_scale)))
+            ratio_x = bg_w / thumb_w
+            ratio_y = bg_h / thumb_h
+
+        orig_crop_x = int(round(crop_x_thumb * ratio_x))
+        orig_crop_y = int(round(crop_y_thumb * ratio_y))
+        orig_crop_w = int(round(crop_w_thumb * ratio_x))
+        orig_crop_h = int(round(crop_h_thumb * ratio_y))
+
+        if orig_crop_w <= 0 or orig_crop_h <= 0:
+            raise RuntimeError("Stage 4 resolved crop dimensions are invalid")
+
+        # Clamp crop against background bounds to avoid PIL errors.
+        orig_crop_x = max(0, min(orig_crop_x, bg_w - 1))
+        orig_crop_y = max(0, min(orig_crop_y, bg_h - 1))
+        orig_crop_w = max(1, min(orig_crop_w, bg_w - orig_crop_x))
+        orig_crop_h = max(1, min(orig_crop_h, bg_h - orig_crop_y))
+
+        t_resize = time.perf_counter()
+        qwen_resized = qwen_img.resize((orig_crop_w, orig_crop_h), Image.Resampling.LANCZOS)
+        mask_resized_l = mask_img.resize((orig_crop_w, orig_crop_h), Image.Resampling.LANCZOS).convert("L")
+        resize_inputs_ms = int(round((time.perf_counter() - t_resize) * 1000))
+
+        feather_radius = min(20, max(3, int(round(min(orig_crop_w, orig_crop_h) * 0.015))))
+        t_feather = time.perf_counter()
+        feathered = mask_resized_l.filter(ImageFilter.BoxBlur(feather_radius))
+        feathered = feathered.filter(ImageFilter.BoxBlur(feather_radius))
+        feathered = feathered.filter(ImageFilter.BoxBlur(feather_radius))
+        feather_mask_ms = int(round((time.perf_counter() - t_feather) * 1000))
+
+        inv_mask = feathered.point(lambda p: 255 - p)
+
+        t_blend = time.perf_counter()
+        if abs(rotation) < 0.001:
+            crop_bg = bg_img.crop(
+                (orig_crop_x, orig_crop_y, orig_crop_x + orig_crop_w, orig_crop_y + orig_crop_h)
+            )
+            blended = Image.composite(qwen_resized, crop_bg, inv_mask)
+            bg_img.paste(blended, (orig_crop_x, orig_crop_y))
+        else:
+            # Rotated case: replicate pixel mapping semantics from frontend implementation.
+            bg_px = bg_img.load()
+            qwen_px = qwen_resized.load()
+            feathered_px = feathered.load()
+
+            radians = rotation * math.pi / 180.0
+            cos_r = math.cos(radians)
+            sin_r = math.sin(radians)
+            cx = orig_crop_x + (orig_crop_w / 2.0)
+            cy = orig_crop_y + (orig_crop_h / 2.0)
+
+            half_w = orig_crop_w / 2.0
+            half_h = orig_crop_h / 2.0
+
+            for py in range(orig_crop_h):
+                rel_y = py - half_h
+                for px in range(orig_crop_w):
+                    mask_brightness = feathered_px[px, py]
+                    if mask_brightness >= 255:
+                        continue
+
+                    rel_x = px - half_w
+                    ox = int(round(cx + rel_x * cos_r - rel_y * sin_r))
+                    oy = int(round(cy + rel_x * sin_r + rel_y * cos_r))
+
+                    if ox < 0 or oy < 0 or ox >= bg_w or oy >= bg_h:
+                        continue
+
+                    alpha = mask_brightness / 255.0
+                    one_minus = 1.0 - alpha
+                    br, bgc, bb, _ba = bg_px[ox, oy]
+                    qr, qg, qb, _qa = qwen_px[px, py]
+                    bg_px[ox, oy] = (
+                        int(round(br * alpha + qr * one_minus)),
+                        int(round(bgc * alpha + qg * one_minus)),
+                        int(round(bb * alpha + qb * one_minus)),
+                        255,
+                    )
+        blend_ms = int(round((time.perf_counter() - t_blend) * 1000))
+
+        output_path = Path(settings.output_dir) / f"{job.job_id}_reimplanted.png"
+        t_encode = time.perf_counter()
+        compress_level = min(max(settings.worker_stage4_png_compress_level, 0), 9)
+        bg_img.convert("RGB").save(
+            output_path,
+            format="PNG",
+            optimize=settings.worker_stage4_png_optimize,
+            compress_level=compress_level,
+        )
+        encode_ms = int(round((time.perf_counter() - t_encode) * 1000))
+        output_bytes = output_path.stat().st_size if output_path.exists() else 0
+
+        timings = {
+            "loadBackgroundMs": load_background_ms,
+            "downloadQwenMs": download_qwen_ms,
+            "downloadMaskMs": download_mask_ms,
+            "resizeInputsMs": resize_inputs_ms,
+            "featherMaskMs": feather_mask_ms,
+            "blendMs": blend_ms,
+            "encodeMs": encode_ms,
+            "totalStage4Ms": int(round((time.perf_counter() - t0) * 1000)),
+            "outputBytes": int(output_bytes),
+            "cropWidthPx": int(orig_crop_w),
+            "cropHeightPx": int(orig_crop_h),
+            "pngCompressLevel": int(compress_level),
+            "pngOptimize": 1 if settings.worker_stage4_png_optimize else 0,
+        }
+        return output_path, bg_w, bg_h, timings
 
     def _build_workflow_paths(self) -> dict[str, str]:
         if settings.workflow_templates_json.strip():
@@ -323,10 +509,70 @@ class ConvexPullWorker:
                 },
             )
 
+            workflow_key, template = self._select_template(job)
+
+            if workflow_key == "estuches_stage4_reimplant_feather":
+                self._emit_event(job.job_id, {"type": "stage4_reimplant_started"})
+                result_path, result_w, result_h, stage4_timings = self._process_stage4_reimplant(job, input_bytes)
+
+                if settings.worker_stage4_emit_timing_events:
+                    self._emit_event(
+                        job.job_id,
+                        {
+                            "type": "stage4_reimplant_timing",
+                            **stage4_timings,
+                        },
+                    )
+
+                t_upload = time.perf_counter()
+                upload = self._convex.upload_file_to_convex(
+                    file_path=str(result_path),
+                    content_type="image/png",
+                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                )
+                upload_ms = int(round((time.perf_counter() - t_upload) * 1000))
+
+                if settings.worker_stage4_emit_timing_events:
+                    self._emit_event(
+                        job.job_id,
+                        {
+                            "type": "stage4_reimplant_upload_timing",
+                            "uploadMs": upload_ms,
+                            "uploadedBytes": stage4_timings.get("outputBytes", 0),
+                        },
+                    )
+                try:
+                    result_path.unlink(missing_ok=True)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    print(f"[worker] stage4 cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                result_payload = {
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "resultWidth": result_w,
+                    "resultHeight": result_h,
+                }
+
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=upload["storageId"],
+                    result=result_payload,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "job_completed",
+                        "resultStorageId": upload["storageId"],
+                        "resultWidth": result_w,
+                        "resultHeight": result_h,
+                    },
+                )
+                return
+
             uploaded = self._comfy.upload_image_bytes(input_bytes, f"{job.job_id}.png")
             self._emit_event(job.job_id, {"type": "comfy_input_uploaded", "data": uploaded})
 
-            workflow_key, template = self._select_template(job)
             width = job.width if job.width is not None else settings.default_width
             height = job.height if job.height is not None else settings.default_height
 

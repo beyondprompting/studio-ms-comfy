@@ -48,6 +48,16 @@ class Settings:
     worker_source_cache_max_entries: int = int(os.getenv("WORKER_SOURCE_CACHE_MAX_ENTRIES", "8"))
     worker_emit_all_comfy_events: bool = os.getenv("WORKER_EMIT_ALL_COMFY_EVENTS", "false").lower() == "true"
     worker_ws_event_sample_every: int = int(os.getenv("WORKER_WS_EVENT_SAMPLE_EVERY", "8"))
+    worker_stage4_emit_timing_events: bool = (
+        os.getenv("WORKER_STAGE4_EMIT_TIMING_EVENTS", "true").lower() == "true"
+    )
+    worker_stage4_png_optimize: bool = (
+        os.getenv("WORKER_STAGE4_PNG_OPTIMIZE", "false").lower() == "true"
+    )
+    worker_stage4_png_compress_level: int = int(
+        os.getenv("WORKER_STAGE4_PNG_COMPRESS_LEVEL", "1")
+    )
 
 
 settings = Settings()
+

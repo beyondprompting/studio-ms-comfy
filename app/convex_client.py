@@ -29,6 +29,7 @@ class ClaimedJob:
     workflow_key: str | None = None
     request_id: str | None = None
     crop_region: dict[str, int | float] | None = None
+    params: dict[str, Any] | None = None
 
 
 class ConvexBridge:
@@ -67,6 +68,9 @@ class ConvexBridge:
             return None
 
         request = body.get("request") if isinstance(body.get("request"), dict) else {}
+        params = body.get("params") if isinstance(body.get("params"), dict) else None
+        if params is None:
+            params = request if request else None
         crop_region = body.get("cropRegion") if isinstance(body.get("cropRegion"), dict) else None
         if crop_region is None:
             crop_region = request.get("cropRegion") if isinstance(request.get("cropRegion"), dict) else {}
@@ -126,6 +130,7 @@ class ConvexBridge:
             workflow_key=str(workflow_key) if workflow_key is not None else None,
             request_id=str(request_id) if request_id is not None else None,
             crop_region=parsed_crop_region,
+            params=params,
         )
 
     def append_job_event(self, append_event_mutation: str, job_id: str, event: dict[str, Any]) -> None:
