@@ -541,6 +541,30 @@ class ConvexPullWorker:
                             "uploadedBytes": stage4_timings.get("outputBytes", 0),
                         },
                     )
+
+                thumb_upload = None
+                thumb_path = self._create_thumbnail_file(
+                    source_path=str(result_path),
+                    job_id=job.job_id,
+                )
+                if thumb_path:
+                    thumb_upload = self._convex.upload_file_to_convex(
+                        file_path=str(thumb_path),
+                        content_type="image/jpeg",
+                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                    )
+                    self._emit_event(
+                        job.job_id,
+                        {
+                            "type": "thumbnail_uploaded",
+                            "thumbnailStorageId": thumb_upload["storageId"],
+                        },
+                    )
+                    try:
+                        thumb_path.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] thumbnail cleanup failed for {job.job_id}: {cleanup_exc}")
+
                 try:
                     result_path.unlink(missing_ok=True)
                 except Exception as cleanup_exc:  # noqa: BLE001
@@ -551,6 +575,7 @@ class ConvexPullWorker:
                     "workflowKey": workflow_key,
                     "resultWidth": result_w,
                     "resultHeight": result_h,
+                    "thumbnailStorageId": thumb_upload["storageId"] if thumb_upload else None,
                 }
 
                 self._convex.mark_job_completed(
@@ -712,27 +737,30 @@ class ConvexPullWorker:
                 return
 
             thumb_upload = None
-            thumb_path = self._create_thumbnail_file(
-                source_path=comfy_result.output_file_path,
-                job_id=job.job_id,
-            )
-            if thumb_path:
-                thumb_upload = self._convex.upload_file_to_convex(
-                    file_path=str(thumb_path),
-                    content_type="image/jpeg",
-                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+            # Stage 1 already outputs the real thumbnail image. Creating another
+            # thumbnail here duplicates small files in Convex storage.
+            if workflow_key != "estuches_stage1_resize_image_mask_node":
+                thumb_path = self._create_thumbnail_file(
+                    source_path=comfy_result.output_file_path,
+                    job_id=job.job_id,
                 )
-                self._emit_event(
-                    job.job_id,
-                    {
-                        "type": "thumbnail_uploaded",
-                        "thumbnailStorageId": thumb_upload["storageId"],
-                    },
-                )
-                try:
-                    thumb_path.unlink(missing_ok=True)
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    print(f"[worker] thumbnail cleanup failed for {job.job_id}: {cleanup_exc}")
+                if thumb_path:
+                    thumb_upload = self._convex.upload_file_to_convex(
+                        file_path=str(thumb_path),
+                        content_type="image/jpeg",
+                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                    )
+                    self._emit_event(
+                        job.job_id,
+                        {
+                            "type": "thumbnail_uploaded",
+                            "thumbnailStorageId": thumb_upload["storageId"],
+                        },
+                    )
+                    try:
+                        thumb_path.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] thumbnail cleanup failed for {job.job_id}: {cleanup_exc}")
 
             result_payload = {
                 "promptId": comfy_result.prompt_id,
