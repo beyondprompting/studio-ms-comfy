@@ -129,6 +129,43 @@ class ConvexPullWorker:
         with Image.open(BytesIO(response.content)) as img:
             return img.convert("RGBA")
 
+    def _upload_files_to_convex_parallel(
+        self,
+        files: dict[str, tuple[Path, str]],
+        *,
+        max_workers: int = 4,
+    ) -> dict[str, dict[str, Any]]:
+        upload_jobs: dict[str, tuple[str, bytes, str]] = {}
+        for key, (path, content_type) in files.items():
+            upload_url = self._convex.mutation(settings.convex_generate_upload_url_mutation, {})
+            upload_jobs[key] = (upload_url, path.read_bytes(), content_type)
+
+        def _post_upload(job_data: tuple[str, bytes, str]) -> dict[str, Any]:
+            upload_url, data, content_type = job_data
+            response = requests.post(
+                upload_url,
+                data=data,
+                headers={"Content-Type": content_type},
+                timeout=120,
+            )
+            response.raise_for_status()
+            body = response.json()
+            storage_id = body.get("storageId")
+            if not storage_id:
+                raise RuntimeError("Convex upload response did not contain storageId")
+            return {"storageId": storage_id, "uploadResponse": body}
+
+        if not upload_jobs:
+            return {}
+
+        worker_count = max(1, min(max_workers, len(upload_jobs)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                key: executor.submit(_post_upload, job_data)
+                for key, job_data in upload_jobs.items()
+            }
+            return {key: future.result() for key, future in futures.items()}
+
     def _process_stage4_reimplant(
         self,
         job: ClaimedJob,
@@ -681,13 +718,15 @@ class ConvexPullWorker:
             "mask": output_dir / f"{job.job_id}_stage3_mask.png",
             "displayComposite": output_dir / f"{job.job_id}_stage3_display.png",
             "qwenComposite": output_dir / f"{job.job_id}_stage3_qwen_composite.png",
-            "qwenCrop": output_dir / f"{job.job_id}_stage3_qwen_crop.png",
         }
+        if qwen_scale > 1.0001:
+            paths["qwenCrop"] = output_dir / f"{job.job_id}_stage3_qwen_crop.png"
         mask_rgba = Image.merge("RGBA", (qwen_mask, qwen_mask, qwen_mask, Image.new("L", qwen_mask.size, 255)))
         self._encode_image(mask_rgba, paths["mask"], image_format="PNG")
         self._encode_image(display_composite.convert("RGBA"), paths["displayComposite"], image_format="PNG")
         self._encode_image(qwen_composite.convert("RGBA"), paths["qwenComposite"], image_format="PNG")
-        self._encode_image(qwen_crop.convert("RGBA"), paths["qwenCrop"], image_format="PNG")
+        if "qwenCrop" in paths:
+            self._encode_image(qwen_crop.convert("RGBA"), paths["qwenCrop"], image_format="PNG")
 
         thumb_paths = {
             key: self._create_thumbnail_file(str(path), f"{job.job_id}_{key}")
@@ -702,6 +741,7 @@ class ConvexPullWorker:
             "qwenWidth": int(qwen_w),
             "qwenHeight": int(qwen_h),
             "qwenScale": float(qwen_scale),
+            "reusedSourceCrop": 0 if "qwenCrop" in paths else 1,
             "productWidth": int(product_full_w),
             "productHeight": int(product_full_h),
             "thumbnailCanvasWidth": int(round(thumb_w)),
@@ -712,6 +752,7 @@ class ConvexPullWorker:
             "thumbPaths": thumb_paths,
             "maskBounds": mask_bounds,
             "timings": timings,
+            "reusedSourceCrop": "qwenCrop" not in paths,
         }
 
     def _resolve_crop_region(self, job: ClaimedJob, width: int, height: int) -> tuple[int, int, int, int]:
@@ -1110,24 +1151,30 @@ class ConvexPullWorker:
                     },
                 )
 
-                uploads: dict[str, dict[str, Any]] = {}
-                thumbnail_uploads: dict[str, dict[str, Any] | None] = {}
-                for key, path in stage3_result["paths"].items():
-                    uploads[key] = self._convex.upload_file_to_convex(
-                        file_path=str(path),
-                        content_type="image/png",
-                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
-                    )
-
-                for key, path in stage3_result["thumbPaths"].items():
-                    if path is None:
-                        thumbnail_uploads[key] = None
-                        continue
-                    thumbnail_uploads[key] = self._convex.upload_file_to_convex(
-                        file_path=str(path),
-                        content_type="image/jpeg",
-                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
-                    )
+                t_upload = time.perf_counter()
+                upload_inputs = {
+                    key: (path, "image/png")
+                    for key, path in stage3_result["paths"].items()
+                }
+                thumbnail_upload_inputs = {
+                    key: (path, "image/jpeg")
+                    for key, path in stage3_result["thumbPaths"].items()
+                    if path is not None
+                }
+                uploads = self._upload_files_to_convex_parallel(upload_inputs, max_workers=4)
+                thumbnail_uploads = self._upload_files_to_convex_parallel(
+                    thumbnail_upload_inputs,
+                    max_workers=4,
+                )
+                upload_ms = int(round((time.perf_counter() - t_upload) * 1000))
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "stage3_upload_timing",
+                        "uploadMs": upload_ms,
+                        "fileCount": len(upload_inputs) + len(thumbnail_upload_inputs),
+                    },
+                )
 
                 for path in list(stage3_result["paths"].values()) + [
                     p for p in stage3_result["thumbPaths"].values() if p is not None
@@ -1144,22 +1191,23 @@ class ConvexPullWorker:
                     "maskStorageId": uploads["mask"]["storageId"],
                     "displayCompositeStorageId": uploads["displayComposite"]["storageId"],
                     "qwenCompositeStorageId": uploads["qwenComposite"]["storageId"],
-                    "qwenCropStorageId": uploads["qwenCrop"]["storageId"],
+                    "qwenCropStorageId": uploads["qwenCrop"]["storageId"] if "qwenCrop" in uploads else None,
+                    "qwenCropSourceImageId": job.source_image_id if stage3_result.get("reusedSourceCrop") else None,
                     "maskThumbnailStorageId": (
-                        thumbnail_uploads["mask"]["storageId"] if thumbnail_uploads["mask"] else None
+                        thumbnail_uploads["mask"]["storageId"] if thumbnail_uploads.get("mask") else None
                     ),
                     "displayCompositeThumbnailStorageId": (
                         thumbnail_uploads["displayComposite"]["storageId"]
-                        if thumbnail_uploads["displayComposite"]
+                        if thumbnail_uploads.get("displayComposite")
                         else None
                     ),
                     "qwenCompositeThumbnailStorageId": (
                         thumbnail_uploads["qwenComposite"]["storageId"]
-                        if thumbnail_uploads["qwenComposite"]
+                        if thumbnail_uploads.get("qwenComposite")
                         else None
                     ),
                     "qwenCropThumbnailStorageId": (
-                        thumbnail_uploads["qwenCrop"]["storageId"] if thumbnail_uploads["qwenCrop"] else None
+                        thumbnail_uploads["qwenCrop"]["storageId"] if thumbnail_uploads.get("qwenCrop") else None
                     ),
                     "maskBounds": stage3_result["maskBounds"],
                     "timings": stage3_result["timings"],

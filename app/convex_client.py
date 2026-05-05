@@ -22,6 +22,8 @@ class ClaimedJob:
     width: int | None
     height: int | None
     crop: str
+    source_image_id: str | None = None
+    source_storage_id: str | None = None
     crop_x: int | None = None
     crop_y: int | None = None
     crop_width: int | None = None
@@ -102,6 +104,8 @@ class ConvexBridge:
             or request.get("stage")
         )
         request_id = body.get("requestId") or request.get("requestId")
+        source_image_id = body.get("sourceImageId") or request.get("sourceImageId")
+        source_storage_id = body.get("sourceStorageId") or request.get("sourceStorageId")
 
         if not job_id or not source_image_url:
             raise RuntimeError(
@@ -123,6 +127,8 @@ class ConvexBridge:
             width=int(width) if width is not None else None,
             height=int(height) if height is not None else None,
             crop=str(crop),
+            source_image_id=str(source_image_id) if source_image_id is not None else None,
+            source_storage_id=str(source_storage_id) if source_storage_id is not None else None,
             crop_x=int(crop_x) if crop_x is not None else None,
             crop_y=int(crop_y) if crop_y is not None else None,
             crop_width=int(crop_width) if crop_width is not None else None,
