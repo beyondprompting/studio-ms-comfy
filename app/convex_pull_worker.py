@@ -677,16 +677,6 @@ class ConvexPullWorker:
         )
         mask_bounds = self._mask_bounds(mask_full)
 
-        display_composite = crop.copy()
-        self._paste_center_alpha(
-            display_composite,
-            product_thumb,
-            product_center_x,
-            product_center_y,
-            product_full_w,
-            product_full_h,
-        )
-
         silhouette_composite = crop.copy()
         self._paste_center_alpha(
             silhouette_composite,
@@ -716,21 +706,21 @@ class ConvexPullWorker:
         output_dir = Path(settings.output_dir)
         paths = {
             "mask": output_dir / f"{job.job_id}_stage3_mask.png",
-            "displayComposite": output_dir / f"{job.job_id}_stage3_display.png",
             "qwenComposite": output_dir / f"{job.job_id}_stage3_qwen_composite.png",
         }
         if qwen_scale > 1.0001:
             paths["qwenCrop"] = output_dir / f"{job.job_id}_stage3_qwen_crop.png"
         mask_rgba = Image.merge("RGBA", (qwen_mask, qwen_mask, qwen_mask, Image.new("L", qwen_mask.size, 255)))
         self._encode_image(mask_rgba, paths["mask"], image_format="PNG")
-        self._encode_image(display_composite.convert("RGBA"), paths["displayComposite"], image_format="PNG")
         self._encode_image(qwen_composite.convert("RGBA"), paths["qwenComposite"], image_format="PNG")
         if "qwenCrop" in paths:
             self._encode_image(qwen_crop.convert("RGBA"), paths["qwenCrop"], image_format="PNG")
 
         thumb_paths = {
-            key: self._create_thumbnail_file(str(path), f"{job.job_id}_{key}")
-            for key, path in paths.items()
+            "qwenComposite": self._create_thumbnail_file(
+                str(paths["qwenComposite"]),
+                f"{job.job_id}_qwenComposite",
+            ),
         }
 
         timings = {
@@ -1189,18 +1179,9 @@ class ConvexPullWorker:
                     "workflowKey": workflow_key,
                     "processor": "pil",
                     "maskStorageId": uploads["mask"]["storageId"],
-                    "displayCompositeStorageId": uploads["displayComposite"]["storageId"],
                     "qwenCompositeStorageId": uploads["qwenComposite"]["storageId"],
                     "qwenCropStorageId": uploads["qwenCrop"]["storageId"] if "qwenCrop" in uploads else None,
                     "qwenCropSourceImageId": job.source_image_id if stage3_result.get("reusedSourceCrop") else None,
-                    "maskThumbnailStorageId": (
-                        thumbnail_uploads["mask"]["storageId"] if thumbnail_uploads.get("mask") else None
-                    ),
-                    "displayCompositeThumbnailStorageId": (
-                        thumbnail_uploads["displayComposite"]["storageId"]
-                        if thumbnail_uploads.get("displayComposite")
-                        else None
-                    ),
                     "qwenCompositeThumbnailStorageId": (
                         thumbnail_uploads["qwenComposite"]["storageId"]
                         if thumbnail_uploads.get("qwenComposite")
