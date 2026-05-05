@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from io import BytesIO
@@ -138,6 +139,11 @@ class ConvexPullWorker:
         qwen_result_url = params.get("qwenResultUrl") if isinstance(params.get("qwenResultUrl"), str) else None
         mask_url = params.get("maskUrl") if isinstance(params.get("maskUrl"), str) else None
         thumbnail_max_size = self._safe_int(params.get("thumbnailMaxSize")) or 600
+        original_crop_region = (
+            params.get("originalCropRegion")
+            if isinstance(params.get("originalCropRegion"), dict)
+            else None
+        )
 
         if not qwen_result_url or not mask_url:
             raise RuntimeError("Stage 4 missing required params: qwenResultUrl or maskUrl")
@@ -193,10 +199,28 @@ class ConvexPullWorker:
             ratio_x = bg_w / thumb_w
             ratio_y = bg_h / thumb_h
 
-        orig_crop_x = int(round(crop_x_thumb * ratio_x))
-        orig_crop_y = int(round(crop_y_thumb * ratio_y))
-        orig_crop_w = int(round(crop_w_thumb * ratio_x))
-        orig_crop_h = int(round(crop_h_thumb * ratio_y))
+        crop_computed_from = "thumbnail_space"
+        orig_x_param = self._safe_float(original_crop_region.get("x")) if original_crop_region else None
+        orig_y_param = self._safe_float(original_crop_region.get("y")) if original_crop_region else None
+        orig_w_param = self._safe_float(original_crop_region.get("width")) if original_crop_region else None
+        orig_h_param = self._safe_float(original_crop_region.get("height")) if original_crop_region else None
+
+        if (
+            orig_x_param is not None
+            and orig_y_param is not None
+            and orig_w_param is not None
+            and orig_h_param is not None
+        ):
+            orig_crop_x = int(round(orig_x_param))
+            orig_crop_y = int(round(orig_y_param))
+            orig_crop_w = int(round(orig_w_param))
+            orig_crop_h = int(round(orig_h_param))
+            crop_computed_from = "original_crop_region"
+        else:
+            orig_crop_x = int(round(crop_x_thumb * ratio_x))
+            orig_crop_y = int(round(crop_y_thumb * ratio_y))
+            orig_crop_w = int(round(crop_w_thumb * ratio_x))
+            orig_crop_h = int(round(crop_h_thumb * ratio_y))
 
         if orig_crop_w <= 0 or orig_crop_h <= 0:
             raise RuntimeError("Stage 4 resolved crop dimensions are invalid")
@@ -208,8 +232,15 @@ class ConvexPullWorker:
         orig_crop_h = max(1, min(orig_crop_h, bg_h - orig_crop_y))
 
         t_resize = time.perf_counter()
-        qwen_resized = qwen_img.resize((orig_crop_w, orig_crop_h), Image.Resampling.LANCZOS)
-        mask_resized_l = mask_img.resize((orig_crop_w, orig_crop_h), Image.Resampling.LANCZOS).convert("L")
+        target_crop_size = (orig_crop_w, orig_crop_h)
+        if qwen_img.size == target_crop_size:
+            qwen_resized = qwen_img
+        else:
+            qwen_resized = qwen_img.resize(target_crop_size, Image.Resampling.LANCZOS)
+        if mask_img.size == target_crop_size:
+            mask_resized_l = mask_img.convert("L")
+        else:
+            mask_resized_l = mask_img.resize(target_crop_size, Image.Resampling.LANCZOS).convert("L")
         resize_inputs_ms = int(round((time.perf_counter() - t_resize) * 1000))
 
         feather_radius = min(20, max(3, int(round(min(orig_crop_w, orig_crop_h) * 0.015))))
@@ -293,6 +324,7 @@ class ConvexPullWorker:
             "outputBytes": int(output_bytes),
             "cropWidthPx": int(orig_crop_w),
             "cropHeightPx": int(orig_crop_h),
+            "cropComputedFrom": 1 if crop_computed_from == "original_crop_region" else 0,
             "pngCompressLevel": int(compress_level),
             "pngOptimize": 1 if settings.worker_stage4_png_optimize else 0,
         }
@@ -337,6 +369,350 @@ class ConvexPullWorker:
     def _validate_positive_int(name: str, value: int) -> None:
         if value <= 0:
             raise RuntimeError(f"Invalid {name}: expected a positive integer, got {value}")
+
+    @staticmethod
+    def _encode_image(
+        image: Image.Image,
+        output_path: Path,
+        *,
+        image_format: str,
+        quality: int | None = None,
+    ) -> None:
+        save_kwargs: dict[str, Any] = {"format": image_format}
+        if image_format == "JPEG":
+            save_kwargs.update({"quality": quality or 85, "optimize": True})
+        elif image_format == "PNG":
+            save_kwargs.update({"optimize": False, "compress_level": 1})
+        image.save(output_path, **save_kwargs)
+
+    def _create_thumbnail_file_from_image(self, image: Image.Image, job_id: str) -> Path:
+        thumb_path = Path(settings.output_dir) / f"{job_id}_thumb.jpg"
+        thumbnail = image.convert("RGB")
+        thumbnail.thumbnail((self._THUMB_MAX_SIZE, self._THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
+        self._encode_image(thumbnail, thumb_path, image_format="JPEG", quality=85)
+        return thumb_path
+
+    def _process_stage1_thumbnail_pil(
+        self,
+        job: ClaimedJob,
+        input_bytes: bytes,
+    ) -> tuple[Path, int, int, dict[str, int]]:
+        t0 = time.perf_counter()
+        with Image.open(BytesIO(input_bytes)) as src:
+            image = src.convert("RGB")
+        load_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        t_resize = time.perf_counter()
+        image.thumbnail((self._THUMB_MAX_SIZE, self._THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
+        resize_ms = int(round((time.perf_counter() - t_resize) * 1000))
+
+        output_path = Path(settings.output_dir) / f"{job.job_id}_stage1_thumb.jpg"
+        t_encode = time.perf_counter()
+        self._encode_image(image, output_path, image_format="JPEG", quality=85)
+        encode_ms = int(round((time.perf_counter() - t_encode) * 1000))
+
+        timings = {
+            "loadMs": load_ms,
+            "resizeMs": resize_ms,
+            "encodeMs": encode_ms,
+            "totalMs": int(round((time.perf_counter() - t0) * 1000)),
+            "outputBytes": int(output_path.stat().st_size if output_path.exists() else 0),
+            "resultWidth": int(image.width),
+            "resultHeight": int(image.height),
+        }
+        return output_path, image.width, image.height, timings
+
+    def _process_stage2_crop_pil(
+        self,
+        job: ClaimedJob,
+        input_bytes: bytes,
+        source_width: int | None,
+        source_height: int | None,
+    ) -> tuple[Path, Path, int, int, dict[str, int | str]]:
+        t0 = time.perf_counter()
+        with Image.open(BytesIO(input_bytes)) as src_raw:
+            source = src_raw.convert("RGBA")
+        load_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        real_source_w = source_width or source.width
+        real_source_h = source_height or source.height
+
+        crop_region_from_thumb = self._resolve_stage2_crop_from_thumbnail_space(
+            job,
+            real_source_w,
+            real_source_h,
+        )
+        crop_computed_from = "thumbnail_space"
+        if crop_region_from_thumb is not None:
+            crop_x, crop_y, crop_width, crop_height = crop_region_from_thumb
+        else:
+            crop_computed_from = "scaled_region"
+            crop_x, crop_y, crop_width, crop_height = self._resolve_crop_region(
+                job,
+                real_source_w,
+                real_source_h,
+            )
+
+        t_crop = time.perf_counter()
+        crop = source.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+        crop_ms = int(round((time.perf_counter() - t_crop) * 1000))
+
+        output_path = Path(settings.output_dir) / f"{job.job_id}_crop.png"
+        t_encode_crop = time.perf_counter()
+        self._encode_image(crop, output_path, image_format="PNG")
+        encode_crop_ms = int(round((time.perf_counter() - t_encode_crop) * 1000))
+
+        t_thumb = time.perf_counter()
+        thumb_path = self._create_thumbnail_file_from_image(crop, job.job_id)
+        thumbnail_ms = int(round((time.perf_counter() - t_thumb) * 1000))
+
+        timings = {
+            "loadMs": load_ms,
+            "cropMs": crop_ms,
+            "encodeCropMs": encode_crop_ms,
+            "thumbnailMs": thumbnail_ms,
+            "totalMs": int(round((time.perf_counter() - t0) * 1000)),
+            "outputBytes": int(output_path.stat().st_size if output_path.exists() else 0),
+            "thumbnailBytes": int(thumb_path.stat().st_size if thumb_path.exists() else 0),
+            "sourceWidth": int(real_source_w),
+            "sourceHeight": int(real_source_h),
+            "cropX": int(crop_x),
+            "cropY": int(crop_y),
+            "cropWidth": int(crop_width),
+            "cropHeight": int(crop_height),
+            "resultWidth": int(crop.width),
+            "resultHeight": int(crop.height),
+            "cropComputedFrom": crop_computed_from,
+        }
+        thumb_scale = min(
+            1.0,
+            self._THUMB_MAX_SIZE / max(crop.width, 1),
+            self._THUMB_MAX_SIZE / max(crop.height, 1),
+        )
+        timings["thumbnailWidth"] = int(round(crop.width * thumb_scale))
+        timings["thumbnailHeight"] = int(round(crop.height * thumb_scale))
+        return output_path, thumb_path, crop.width, crop.height, timings
+
+    @staticmethod
+    def _decode_data_url_image(data_url: str) -> Image.Image:
+        if "," in data_url and data_url.strip().startswith("data:"):
+            _, encoded = data_url.split(",", 1)
+        else:
+            encoded = data_url
+        raw = base64.b64decode(encoded)
+        with Image.open(BytesIO(raw)) as img:
+            return img.convert("RGBA")
+
+    @staticmethod
+    def _resize_to_fit(image: Image.Image, max_width: int, max_height: int) -> Image.Image:
+        resized = image.copy()
+        if resized.width <= max_width and resized.height <= max_height:
+            return resized
+        ratio = min(max_width / resized.width, max_height / resized.height)
+        next_size = (
+            max(1, int(round(resized.width * ratio))),
+            max(1, int(round(resized.height * ratio))),
+        )
+        return resized.resize(next_size, Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _white_silhouette(product: Image.Image) -> Image.Image:
+        silhouette = Image.new("RGBA", product.size, (255, 255, 255, 0))
+        alpha = product.getchannel("A")
+        solid_alpha = alpha.point(lambda p: 255 if p > 128 else 0)
+        silhouette.putalpha(solid_alpha)
+        return silhouette
+
+    @staticmethod
+    def _paste_center_alpha(
+        base: Image.Image,
+        overlay: Image.Image,
+        center_x: float,
+        center_y: float,
+        width: int,
+        height: int,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+        resized = overlay.resize((width, height), Image.Resampling.LANCZOS)
+        x = int(round(center_x - width / 2))
+        y = int(round(center_y - height / 2))
+        base.alpha_composite(resized, (x, y))
+
+    @staticmethod
+    def _draw_product_on_mask(
+        mask_l: Image.Image,
+        product: Image.Image,
+        center_x: float,
+        center_y: float,
+        width: int,
+        height: int,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            return
+        alpha = product.getchannel("A").resize((width, height), Image.Resampling.LANCZOS)
+        black_shape = Image.new("L", (width, height), 0)
+        x = int(round(center_x - width / 2))
+        y = int(round(center_y - height / 2))
+        mask_l.paste(black_shape, (x, y), alpha)
+
+    @staticmethod
+    def _mask_bounds(mask_l: Image.Image) -> dict[str, int]:
+        min_x = mask_l.width
+        min_y = mask_l.height
+        max_x = 0
+        max_y = 0
+        found = False
+        px = mask_l.load()
+        for y in range(mask_l.height):
+            for x in range(mask_l.width):
+                if px[x, y] < 128:
+                    found = True
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
+                    max_x = max(max_x, x)
+                    max_y = max(max_y, y)
+        if not found:
+            return {"x": 0, "y": 0, "width": mask_l.width, "height": mask_l.height}
+        return {
+            "x": int(min_x),
+            "y": int(min_y),
+            "width": int(max_x - min_x + 1),
+            "height": int(max_y - min_y + 1),
+        }
+
+    def _process_stage3_mask_composite(
+        self,
+        job: ClaimedJob,
+        input_bytes: bytes,
+    ) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        params = job.params if isinstance(job.params, dict) else {}
+        product_url = params.get("productUrl") if isinstance(params.get("productUrl"), str) else None
+        mask_data_url = (
+            params.get("combinedMaskDataUrl")
+            if isinstance(params.get("combinedMaskDataUrl"), str)
+            else None
+        )
+        if not product_url or not mask_data_url:
+            raise RuntimeError("Stage 3 missing required params: productUrl or combinedMaskDataUrl")
+
+        product_position = params.get("productPosition") if isinstance(params.get("productPosition"), dict) else {}
+        product_x = self._safe_float(product_position.get("x")) or 0.0
+        product_y = self._safe_float(product_position.get("y")) or 0.0
+        product_scale = self._safe_float(params.get("productScale")) or 1.0
+        thumb_w = self._safe_float(params.get("thumbnailCanvasWidth"))
+        thumb_h = self._safe_float(params.get("thumbnailCanvasHeight"))
+        min_qwen_pixels = self._safe_int(params.get("qwenMinPixels")) or 1_000_000
+
+        with Image.open(BytesIO(input_bytes)) as crop_raw:
+            crop = crop_raw.convert("RGBA")
+        mask_thumb = self._decode_data_url_image(mask_data_url).convert("L")
+
+        if not thumb_w or thumb_w <= 0:
+            thumb_w = mask_thumb.width
+        if not thumb_h or thumb_h <= 0:
+            thumb_h = mask_thumb.height
+
+        ratio_x = crop.width / thumb_w
+        ratio_y = crop.height / thumb_h
+        mask_full = mask_thumb.resize((crop.width, crop.height), Image.Resampling.LANCZOS).convert("L")
+
+        t_download_product = time.perf_counter()
+        product = self._download_image_rgba(product_url)
+        download_product_ms = int(round((time.perf_counter() - t_download_product) * 1000))
+
+        max_prod_w = max(1, int(round(thumb_w * 0.6)))
+        max_prod_h = max(1, int(round(thumb_h * 0.6)))
+        product_thumb = self._resize_to_fit(product, max_prod_w, max_prod_h)
+        product_full_w = max(1, int(round(product_thumb.width * product_scale * ratio_x)))
+        product_full_h = max(1, int(round(product_thumb.height * product_scale * ratio_y)))
+        product_center_x = product_x * ratio_x
+        product_center_y = product_y * ratio_y
+
+        self._draw_product_on_mask(
+            mask_full,
+            product_thumb,
+            product_center_x,
+            product_center_y,
+            product_full_w,
+            product_full_h,
+        )
+        mask_bounds = self._mask_bounds(mask_full)
+
+        display_composite = crop.copy()
+        self._paste_center_alpha(
+            display_composite,
+            product_thumb,
+            product_center_x,
+            product_center_y,
+            product_full_w,
+            product_full_h,
+        )
+
+        silhouette_composite = crop.copy()
+        self._paste_center_alpha(
+            silhouette_composite,
+            self._white_silhouette(product_thumb),
+            product_center_x,
+            product_center_y,
+            product_full_w,
+            product_full_h,
+        )
+
+        qwen_scale = 1.0
+        crop_pixels = crop.width * crop.height
+        if crop_pixels < min_qwen_pixels:
+            qwen_scale = math.sqrt(min_qwen_pixels / max(crop_pixels, 1))
+        qwen_w = max(1, int(math.ceil(crop.width * qwen_scale)))
+        qwen_h = max(1, int(math.ceil(crop.height * qwen_scale)))
+
+        if qwen_scale > 1.0001:
+            qwen_crop = crop.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
+            qwen_composite = silhouette_composite.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
+            qwen_mask = mask_full.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
+        else:
+            qwen_crop = crop
+            qwen_composite = silhouette_composite
+            qwen_mask = mask_full
+
+        output_dir = Path(settings.output_dir)
+        paths = {
+            "mask": output_dir / f"{job.job_id}_stage3_mask.png",
+            "displayComposite": output_dir / f"{job.job_id}_stage3_display.png",
+            "qwenComposite": output_dir / f"{job.job_id}_stage3_qwen_composite.png",
+            "qwenCrop": output_dir / f"{job.job_id}_stage3_qwen_crop.png",
+        }
+        mask_rgba = Image.merge("RGBA", (qwen_mask, qwen_mask, qwen_mask, Image.new("L", qwen_mask.size, 255)))
+        self._encode_image(mask_rgba, paths["mask"], image_format="PNG")
+        self._encode_image(display_composite.convert("RGBA"), paths["displayComposite"], image_format="PNG")
+        self._encode_image(qwen_composite.convert("RGBA"), paths["qwenComposite"], image_format="PNG")
+        self._encode_image(qwen_crop.convert("RGBA"), paths["qwenCrop"], image_format="PNG")
+
+        thumb_paths = {
+            key: self._create_thumbnail_file(str(path), f"{job.job_id}_{key}")
+            for key, path in paths.items()
+        }
+
+        timings = {
+            "downloadProductMs": download_product_ms,
+            "totalMs": int(round((time.perf_counter() - t0) * 1000)),
+            "cropWidth": int(crop.width),
+            "cropHeight": int(crop.height),
+            "qwenWidth": int(qwen_w),
+            "qwenHeight": int(qwen_h),
+            "qwenScale": float(qwen_scale),
+            "productWidth": int(product_full_w),
+            "productHeight": int(product_full_h),
+            "thumbnailCanvasWidth": int(round(thumb_w)),
+            "thumbnailCanvasHeight": int(round(thumb_h)),
+        }
+        return {
+            "paths": paths,
+            "thumbPaths": thumb_paths,
+            "maskBounds": mask_bounds,
+            "timings": timings,
+        }
 
     def _resolve_crop_region(self, job: ClaimedJob, width: int, height: int) -> tuple[int, int, int, int]:
         crop_x = 0 if job.crop_x is None else job.crop_x
@@ -509,7 +885,7 @@ class ConvexPullWorker:
                 },
             )
 
-            workflow_key, template = self._select_template(job)
+            workflow_key = job.workflow_key or self._default_workflow_key
 
             if workflow_key == "estuches_stage4_reimplant_feather":
                 self._emit_event(job.job_id, {"type": "stage4_reimplant_started"})
@@ -594,6 +970,218 @@ class ConvexPullWorker:
                     },
                 )
                 return
+
+            if workflow_key == "estuches_stage1_resize_image_mask_node":
+                self._emit_event(job.job_id, {"type": "stage1_thumbnail_pil_started"})
+                result_path, result_w, result_h, stage1_timings = self._process_stage1_thumbnail_pil(
+                    job,
+                    input_bytes,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "stage1_thumbnail_pil_timing",
+                        **stage1_timings,
+                    },
+                )
+
+                upload = self._convex.upload_file_to_convex(
+                    file_path=str(result_path),
+                    content_type="image/jpeg",
+                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                )
+
+                try:
+                    result_path.unlink(missing_ok=True)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    print(f"[worker] stage1 cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                result_payload = {
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "processor": "pil",
+                    "mimeType": "image/jpeg",
+                    "resultWidth": result_w,
+                    "resultHeight": result_h,
+                    "timings": stage1_timings,
+                }
+
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=upload["storageId"],
+                    result=result_payload,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "job_completed",
+                        "resultStorageId": upload["storageId"],
+                        "resultWidth": result_w,
+                        "resultHeight": result_h,
+                        "processor": "pil",
+                    },
+                )
+                return
+
+            if workflow_key == "estuches_stage2_crop_fullres":
+                self._emit_event(job.job_id, {"type": "stage2_crop_pil_started"})
+                result_path, thumb_path, result_w, result_h, stage2_timings = self._process_stage2_crop_pil(
+                    job,
+                    input_bytes,
+                    source_width,
+                    source_height,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "stage2_crop_pil_timing",
+                        **stage2_timings,
+                    },
+                )
+
+                upload = self._convex.upload_file_to_convex(
+                    file_path=str(result_path),
+                    content_type="image/png",
+                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                )
+                thumb_upload = self._convex.upload_file_to_convex(
+                    file_path=str(thumb_path),
+                    content_type="image/jpeg",
+                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "thumbnail_uploaded",
+                        "thumbnailStorageId": thumb_upload["storageId"],
+                    },
+                )
+
+                for cleanup_path in (result_path, thumb_path):
+                    try:
+                        cleanup_path.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] stage2 cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                result_payload = {
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "processor": "pil",
+                    "resultWidth": result_w,
+                    "resultHeight": result_h,
+                    "thumbnailStorageId": thumb_upload["storageId"],
+                    "originalCropRegion": {
+                        "x": stage2_timings["cropX"],
+                        "y": stage2_timings["cropY"],
+                        "width": stage2_timings["cropWidth"],
+                        "height": stage2_timings["cropHeight"],
+                    },
+                    "timings": stage2_timings,
+                }
+
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=upload["storageId"],
+                    result=result_payload,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "job_completed",
+                        "resultStorageId": upload["storageId"],
+                        "resultWidth": result_w,
+                        "resultHeight": result_h,
+                        "thumbnailStorageId": thumb_upload["storageId"],
+                        "processor": "pil",
+                    },
+                )
+                return
+
+            if workflow_key == "estuches_stage3_mask_composite":
+                self._emit_event(job.job_id, {"type": "stage3_mask_composite_pil_started"})
+                stage3_result = self._process_stage3_mask_composite(job, input_bytes)
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "stage3_mask_composite_pil_timing",
+                        **stage3_result["timings"],
+                    },
+                )
+
+                uploads: dict[str, dict[str, Any]] = {}
+                thumbnail_uploads: dict[str, dict[str, Any] | None] = {}
+                for key, path in stage3_result["paths"].items():
+                    uploads[key] = self._convex.upload_file_to_convex(
+                        file_path=str(path),
+                        content_type="image/png",
+                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                    )
+
+                for key, path in stage3_result["thumbPaths"].items():
+                    if path is None:
+                        thumbnail_uploads[key] = None
+                        continue
+                    thumbnail_uploads[key] = self._convex.upload_file_to_convex(
+                        file_path=str(path),
+                        content_type="image/jpeg",
+                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                    )
+
+                for path in list(stage3_result["paths"].values()) + [
+                    p for p in stage3_result["thumbPaths"].values() if p is not None
+                ]:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] stage3 cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                result_payload = {
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "processor": "pil",
+                    "maskStorageId": uploads["mask"]["storageId"],
+                    "displayCompositeStorageId": uploads["displayComposite"]["storageId"],
+                    "qwenCompositeStorageId": uploads["qwenComposite"]["storageId"],
+                    "qwenCropStorageId": uploads["qwenCrop"]["storageId"],
+                    "maskThumbnailStorageId": (
+                        thumbnail_uploads["mask"]["storageId"] if thumbnail_uploads["mask"] else None
+                    ),
+                    "displayCompositeThumbnailStorageId": (
+                        thumbnail_uploads["displayComposite"]["storageId"]
+                        if thumbnail_uploads["displayComposite"]
+                        else None
+                    ),
+                    "qwenCompositeThumbnailStorageId": (
+                        thumbnail_uploads["qwenComposite"]["storageId"]
+                        if thumbnail_uploads["qwenComposite"]
+                        else None
+                    ),
+                    "qwenCropThumbnailStorageId": (
+                        thumbnail_uploads["qwenCrop"]["storageId"] if thumbnail_uploads["qwenCrop"] else None
+                    ),
+                    "maskBounds": stage3_result["maskBounds"],
+                    "timings": stage3_result["timings"],
+                }
+
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=uploads["qwenComposite"]["storageId"],
+                    result=result_payload,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "job_completed",
+                        "resultStorageId": uploads["qwenComposite"]["storageId"],
+                        "processor": "pil",
+                    },
+                )
+                return
+
+            workflow_key, template = self._select_template(job)
 
             uploaded = self._comfy.upload_image_bytes(input_bytes, f"{job.job_id}.png")
             self._emit_event(job.job_id, {"type": "comfy_input_uploaded", "data": uploaded})
