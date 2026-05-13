@@ -161,6 +161,27 @@ class ConvexBridge:
     def mark_job_failed(self, mark_failed_mutation: str, job_id: str, error: dict[str, Any]) -> Any:
         return self.mutation(mark_failed_mutation, {"jobId": job_id, "error": error})
 
+    def heartbeat_worker(
+        self,
+        heartbeat_mutation: str,
+        worker_id: str,
+        status: str,
+        current_job_id: str | None = None,
+        current_workflow_key: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "workerId": worker_id,
+            "status": status,
+        }
+        if current_job_id:
+            payload["currentJobId"] = current_job_id
+        if current_workflow_key:
+            payload["currentWorkflowKey"] = current_workflow_key
+        if metadata:
+            payload["metadata"] = metadata
+        return self.mutation(heartbeat_mutation, payload)
+
     def upload_file_to_convex(
         self,
         file_path: str,

@@ -4,6 +4,7 @@ import json
 import math
 import time
 import base64
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from io import BytesIO
@@ -50,6 +51,10 @@ class ConvexPullWorker:
         self._source_image_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
         self._ws_event_counters: dict[str, int] = {}
         self._running = False
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_lock = threading.Lock()
+        self._current_job_id: str | None = None
+        self._current_workflow_key: str | None = None
 
     def _purge_source_cache(self, now: float) -> None:
         ttl = max(settings.worker_source_cache_ttl_seconds, 0)
@@ -841,6 +846,7 @@ class ConvexPullWorker:
             raise RuntimeError("Convex is not configured. Set CONVEX_URL and auth/admin key.")
 
         self._running = True
+        self._start_heartbeat_thread()
         print(
             "[worker] started",
             {
@@ -869,8 +875,53 @@ class ConvexPullWorker:
                 print(f"[worker] loop error: {exc}")
                 time.sleep(max(settings.worker_poll_interval_seconds, 1.0))
 
+        self._send_heartbeat(status="offline", force=True)
+
     def stop(self) -> None:
         self._running = False
+        self._send_heartbeat(status="offline", force=True)
+
+    def _start_heartbeat_thread(self) -> None:
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"{settings.worker_id}-heartbeat",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        self._send_heartbeat(force=True)
+        interval = max(settings.worker_heartbeat_interval_seconds, 1.0)
+        while self._running:
+            time.sleep(interval)
+            self._send_heartbeat()
+
+    def _send_heartbeat(self, status: str | None = None, force: bool = False) -> None:
+        if not self._convex.enabled:
+            return
+        with self._heartbeat_lock:
+            current_job_id = self._current_job_id
+            current_workflow_key = self._current_workflow_key
+
+        resolved_status = status or ("running" if current_job_id else "idle")
+        try:
+            self._convex.heartbeat_worker(
+                settings.convex_worker_heartbeat_mutation,
+                worker_id=settings.worker_id,
+                status=resolved_status,
+                current_job_id=current_job_id if resolved_status == "running" else None,
+                current_workflow_key=current_workflow_key if resolved_status == "running" else None,
+                metadata={
+                    "comfyBaseUrl": settings.comfy_base_url,
+                    "workflowDefaultKey": self._default_workflow_key,
+                    "heartbeatIntervalSeconds": settings.worker_heartbeat_interval_seconds,
+                    "force": force,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[worker] heartbeat failed: {exc}")
 
     def _emit_event(self, job_id: str, event: dict[str, Any]) -> None:
         payload = dict(event)
@@ -882,6 +933,10 @@ class ConvexPullWorker:
             print(f"[worker] append_event failed for {job_id}: {exc}")
 
     def _process_claimed_job(self, job: ClaimedJob) -> None:
+        with self._heartbeat_lock:
+            self._current_job_id = job.job_id
+            self._current_workflow_key = job.workflow_key or self._default_workflow_key
+        self._send_heartbeat(force=True)
         self._ws_event_counters[job.job_id] = 0
         self._emit_event(
             job.job_id,
@@ -1408,6 +1463,11 @@ class ConvexPullWorker:
             finally:
                 self._emit_event(job.job_id, {"type": "job_failed", "error": err})
         finally:
+            with self._heartbeat_lock:
+                if self._current_job_id == job.job_id:
+                    self._current_job_id = None
+                    self._current_workflow_key = None
+            self._send_heartbeat(force=True)
             self._ws_event_counters.pop(job.job_id, None)
 
     def _create_thumbnail_file(self, source_path: str, job_id: str) -> Path | None:

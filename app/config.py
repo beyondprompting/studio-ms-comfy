@@ -43,6 +43,12 @@ class Settings:
     convex_attach_stage2_thumbnail_mutation: str = os.getenv(
         "CONVEX_ATTACH_STAGE2_THUMBNAIL_MUTATION", "comfyJobs:attachStage2Thumbnail"
     )
+    convex_worker_heartbeat_mutation: str = os.getenv(
+        "CONVEX_WORKER_HEARTBEAT_MUTATION", "comfyJobs:heartbeatWorker"
+    )
+    worker_heartbeat_interval_seconds: float = float(
+        os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "5.0")
+    )
     worker_source_cache_enabled: bool = os.getenv("WORKER_SOURCE_CACHE_ENABLED", "true").lower() == "true"
     worker_source_cache_ttl_seconds: float = float(os.getenv("WORKER_SOURCE_CACHE_TTL_SECONDS", "300"))
     worker_source_cache_max_entries: int = int(os.getenv("WORKER_SOURCE_CACHE_MAX_ENTRIES", "8"))
@@ -60,4 +66,3 @@ class Settings:
 
 
 settings = Settings()
-
