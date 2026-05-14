@@ -21,6 +21,13 @@ from .config import settings
 from .convex_client import ClaimedJob, ConvexBridge, ConvexConfig
 from .workflow import build_workflow, load_workflow_template
 
+DEFAULT_QWEN_COMFY_MODEL_NAME = "Qwen-Image-Edit-2509-Q4_K_M.gguf"
+QWEN_COMFY_MODEL_NAMES = {
+    DEFAULT_QWEN_COMFY_MODEL_NAME,
+    "Qwen-Image-Edit-2509-Q5_K_M.gguf",
+    "qwen-image-edit-2511-Q4_K_M.gguf",
+}
+
 
 class ConvexPullWorker:
     _THUMB_MAX_SIZE = 600
@@ -570,9 +577,15 @@ class ConvexPullWorker:
             if params.get("scheduler") in {"beta", "karras"}
             else "beta"
         )
+        comfy_model_name = (
+            params.get("comfyModelName")
+            if params.get("comfyModelName") in QWEN_COMFY_MODEL_NAMES
+            else DEFAULT_QWEN_COMFY_MODEL_NAME
+        )
 
         workflow["28"]["inputs"]["prompt"] = prompt
         workflow["12"]["inputs"]["prompt"] = negative_prompt
+        workflow["35"]["inputs"]["unet_name"] = comfy_model_name
         workflow["150"]["inputs"]["noise_seed"] = (
             seed if seed is not None else random.randint(0, 2**31 - 1)
         )
@@ -607,6 +620,7 @@ class ConvexPullWorker:
             "cfg": cfg,
             "samplerName": sampler_name,
             "scheduler": scheduler,
+            "comfyModelName": comfy_model_name,
         }
         return workflow, timings
 
@@ -1264,6 +1278,7 @@ class ConvexPullWorker:
                     "resultHeight": result_h,
                     "thumbnailStorageId": thumb_upload["storageId"] if thumb_upload else None,
                     "model": params.get("model"),
+                    "comfyModelName": qwen_timings.get("comfyModelName"),
                     "prompt": params.get("prompt"),
                     "seed": params.get("seed"),
                     "timings": qwen_timings,
