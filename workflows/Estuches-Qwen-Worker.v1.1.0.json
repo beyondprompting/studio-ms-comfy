@@ -1,0 +1,554 @@
+{
+  "3": {
+    "inputs": {
+      "samples": [
+        "150",
+        0
+      ],
+      "vae": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "4": {
+    "inputs": {
+      "strength": 1,
+      "model": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "CFGNorm",
+    "_meta": {
+      "title": "CFGNorm"
+    }
+  },
+  "5": {
+    "inputs": {
+      "shift": 3.5,
+      "model": [
+        "528",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingAuraFlow",
+    "_meta": {
+      "title": "ModelSamplingAuraFlow"
+    }
+  },
+  "7": {
+    "inputs": {
+      "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "9": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "12": {
+    "inputs": {
+      "prompt": "- Change or alter the product’s color, hue, saturation, white balance, brightness, contrast, or sharpness; desaturate, whiten, or neutralize the product to gray/default tones for “scene harmony”.\n- Treat colored areas as editable placeholders/templates to be replaced with neutral versions.\n- Alter proportions or geometry: stretch, squash, warp, bend, melt, or distort the product.\n- Change materials, textures, finishes, or surface properties (matte ↔ glossy), or synthesize artificial surface detail (fake texture, noise, grain).\n- Convert transparent/glass/reflective materials into plastic, matte, opaque, simplified, or non-physical surfaces; reduce/remove refraction, light transmission, realistic specular behavior, or material depth in transparent objects.\n- Convert plastic/matte/opaque/non-reflective materials into glass-like, transparent, highly reflective, chrome/metallic, or mirror-like surfaces; add reflective floors or exaggerated surface reflections.\n- Add unrealistic specular highlights, sharp reflections, artificial shine, or forced transparency inconsistent with the source material.\n- Add halos, glow, edge feathering, artificial blending, cutout artifacts, semi-transparent edges, or blurry edges (unless truly transparent in the input).\n- Add internal structures or foreign components (tubes, rods, sticks, nozzles, droppers, pipettes) or invent internal details/components not present in the original product.\n- Substitute the real product with a generic/invented/different item; add duplicates, clones, doubles, or reflected-image “copies”.\n- Modify, recolor, blur, replace, or alter any part of the background/environment, including background hue/saturation changes.\n- Shift, crop, rotate, scale, or change the global camera framing or canvas size.\n- Add any new objects, props, accessories, text, stickers, badges, ribbons, hands, or graphic elements not present in the input.\n- Introduce new light sources or artificial lighting—but allow natural shadows and ambient occlusion consistent with the existing scene lighting.\n- Whiten or “neutralize” dark plastic products (e.g., green/black shampoo bottles) into white/gray while keeping the label; replace the body color with a neutral body tone.\n- Add new props, elements, text, lighting, or graphic details not present in the original.\n- Change or alter the product's color, hue, saturation, brightness, sharpness, material, or structural form.",
+      "clip": [
+        "528",
+        1
+      ],
+      "vae": [
+        "9",
+        0
+      ],
+      "image1": [
+        "523",
+        0
+      ],
+      "image2": [
+        "537",
+        0
+      ],
+      "image3": [
+        "538",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "Prompt Negativo"
+    }
+  },
+  "23": {
+    "inputs": {
+      "scheduler": "beta",
+      "steps": 10,
+      "denoise": 1,
+      "model": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "24": {
+    "inputs": {
+      "sampler_name": "dpmpp_2m_sde_gpu"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "28": {
+    "inputs": {
+      "prompt": "Add the product in Image 2 to the scene and fit it exactly in place of the white placeholder in Image 2. Adapt it to match context lights and project consistent shadows.\n\nCamera angle: front view.\n\nAdjust the camera's perspective and angle to the scene. Preserve product visual integrity.\n\n\nAdjust product's lighting so it blends naturally with the environment.\n\nEnhance the natural light interaction between the product and its surrounding surfaces—generating subtle, soft brightening or reflections where the material would realistically affect nearby areas, matching the scene’s lighting and material properties. Keep these effects physically plausible, localized, and never mirror-like, sharp, or artificial.\n",
+      "clip": [
+        "528",
+        1
+      ],
+      "vae": [
+        "9",
+        0
+      ],
+      "image1": [
+        "536",
+        0
+      ],
+      "image2": [
+        "537",
+        0
+      ],
+      "image3": [
+        "538",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImageEditPlus",
+    "_meta": {
+      "title": "Prompt Positivo"
+    }
+  },
+  "32": {
+    "inputs": {
+      "noise_mask": true,
+      "positive": [
+        "28",
+        0
+      ],
+      "negative": [
+        "12",
+        0
+      ],
+      "vae": [
+        "9",
+        0
+      ],
+      "pixels": [
+        "536",
+        0
+      ],
+      "mask": [
+        "532",
+        0
+      ]
+    },
+    "class_type": "InpaintModelConditioning",
+    "_meta": {
+      "title": "InpaintModelConditioning"
+    }
+  },
+  "35": {
+    "inputs": {
+      "unet_name": "qwen-image-edit-2509-Q4_K_M.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "Unet Loader (GGUF)"
+    }
+  },
+  "150": {
+    "inputs": {
+      "add_noise": true,
+      "noise_seed": 66589528,
+      "cfg": 1,
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "32",
+        0
+      ],
+      "negative": [
+        "32",
+        1
+      ],
+      "sampler": [
+        "24",
+        0
+      ],
+      "sigmas": [
+        "23",
+        0
+      ],
+      "latent_image": [
+        "32",
+        2
+      ]
+    },
+    "class_type": "SamplerCustom",
+    "_meta": {
+      "title": "SamplerCustom"
+    }
+  },
+  "160": {
+    "inputs": {
+      "selection_setting": 2,
+      "input_2": [
+        "35",
+        0
+      ]
+    },
+    "class_type": "TwoWaySwitch",
+    "_meta": {
+      "title": "Switch (Two Way)"
+    }
+  },
+  "522": {
+    "inputs": {
+      "filename_prefix": "Estuches",
+      "images": [
+        "542",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "523": {
+    "inputs": {
+      "image": "rd7d5p1cwn6wfvkk22q9cmn2zn85pc8f.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "524": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-05-12 at 16.29.10 (3).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "525": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-05-12 at 16.29.10.jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "526": {
+    "inputs": {
+      "image": "WhatsApp Image 2026-05-12 at 16.29.10 (2).jpeg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image"
+    }
+  },
+  "528": {
+    "inputs": {
+      "output_strength": 1,
+      "clip_strength_multiplier": 1,
+      "model": [
+        "35",
+        0
+      ],
+      "lora_stack": [
+        "530",
+        0
+      ],
+      "clip": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "LoRAOptimizerSimple",
+    "_meta": {
+      "title": "LoRA Optimizer"
+    }
+  },
+  "530": {
+    "inputs": {
+      "settings_visibility": "simple",
+      "input_mode": "dropdown",
+      "lora_count": 3,
+      "enabled_1": true,
+      "lora_name_1": "estuches/estuches_003-Qwen2509-5000.safetensors",
+      "lora_name_text_1": "None",
+      "strength_1": 1,
+      "model_strength_1": 1,
+      "clip_strength_1": 1,
+      "conflict_mode_1": "all",
+      "key_filter_1": "all",
+      "enabled_2": true,
+      "lora_name_2": "Qwen-Edit-2509-Multi-Angle-Lighting.safetensors",
+      "lora_name_text_2": "None",
+      "strength_2": 1,
+      "model_strength_2": 1,
+      "clip_strength_2": 1,
+      "conflict_mode_2": "all",
+      "key_filter_2": "all",
+      "enabled_3": true,
+      "lora_name_3": "Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors",
+      "lora_name_text_3": "None",
+      "strength_3": 1,
+      "model_strength_3": 1,
+      "clip_strength_3": 1,
+      "conflict_mode_3": "all",
+      "key_filter_3": "all",
+      "enabled_4": true,
+      "lora_name_4": "None",
+      "lora_name_text_4": "None",
+      "strength_4": 1,
+      "model_strength_4": 1,
+      "clip_strength_4": 1,
+      "conflict_mode_4": "all",
+      "key_filter_4": "all",
+      "enabled_5": true,
+      "lora_name_5": "None",
+      "lora_name_text_5": "None",
+      "strength_5": 1,
+      "model_strength_5": 1,
+      "clip_strength_5": 1,
+      "conflict_mode_5": "all",
+      "key_filter_5": "all",
+      "enabled_6": true,
+      "lora_name_6": "None",
+      "lora_name_text_6": "None",
+      "strength_6": 1,
+      "model_strength_6": 1,
+      "clip_strength_6": 1,
+      "conflict_mode_6": "all",
+      "key_filter_6": "all",
+      "enabled_7": true,
+      "lora_name_7": "None",
+      "lora_name_text_7": "None",
+      "strength_7": 1,
+      "model_strength_7": 1,
+      "clip_strength_7": 1,
+      "conflict_mode_7": "all",
+      "key_filter_7": "all",
+      "enabled_8": true,
+      "lora_name_8": "None",
+      "lora_name_text_8": "None",
+      "strength_8": 1,
+      "model_strength_8": 1,
+      "clip_strength_8": 1,
+      "conflict_mode_8": "all",
+      "key_filter_8": "all",
+      "enabled_9": true,
+      "lora_name_9": "None",
+      "lora_name_text_9": "None",
+      "strength_9": 1,
+      "model_strength_9": 1,
+      "clip_strength_9": 1,
+      "conflict_mode_9": "all",
+      "key_filter_9": "all",
+      "enabled_10": true,
+      "lora_name_10": "None",
+      "lora_name_text_10": "None",
+      "strength_10": 1,
+      "model_strength_10": 1,
+      "clip_strength_10": 1,
+      "conflict_mode_10": "all",
+      "key_filter_10": "all",
+      "base_model_filter": "All"
+    },
+    "class_type": "LoRAStackDynamic",
+    "_meta": {
+      "title": "LoRA Stack (Dynamic)"
+    }
+  },
+  "532": {
+    "inputs": {
+      "red": 0,
+      "green": 0,
+      "blue": 0,
+      "threshold": 0,
+      "image": [
+        "539",
+        0
+      ]
+    },
+    "class_type": "MaskFromColor+",
+    "_meta": {
+      "title": "🔧 Mask From Color"
+    }
+  },
+  "534": {
+    "inputs": {
+      "output_strength": 1,
+      "clip_strength_multiplier": 1,
+      "top_n": 3,
+      "normalize_keys": "enabled",
+      "scoring_svd": "disabled",
+      "scoring_device": "gpu",
+      "architecture_preset": "auto",
+      "auto_strength_floor": -1,
+      "community_cache": "disabled",
+      "cache_patches": "enabled",
+      "diff_cache_mode": "auto",
+      "diff_cache_ram_pct": 0.5,
+      "vram_budget": 0,
+      "scoring_speed": "turbo",
+      "scoring_formula": "v2",
+      "output_mode": "merge",
+      "decision_smoothing": 0.25,
+      "smooth_slerp_gate": false,
+      "memory_mode": "auto",
+      "selection": 1
+    },
+    "class_type": "LoRAAutoTuner",
+    "_meta": {
+      "title": "LoRA AutoTuner"
+    }
+  },
+  "536": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": [
+        "543",
+        0
+      ],
+      "resolution_steps": 1,
+      "image": [
+        "523",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "537": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": [
+        "543",
+        0
+      ],
+      "resolution_steps": 1,
+      "image": [
+        "524",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "538": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": [
+        "543",
+        0
+      ],
+      "resolution_steps": 1,
+      "image": [
+        "525",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "539": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "megapixels": [
+        "543",
+        0
+      ],
+      "resolution_steps": 1,
+      "image": [
+        "526",
+        0
+      ]
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "ImageScaleToTotalPixels"
+    }
+  },
+  "541": {
+    "inputs": {
+      "image": [
+        "525",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "542": {
+    "inputs": {
+      "upscale_method": "bicubic",
+      "width": [
+        "541",
+        0
+      ],
+      "height": [
+        "541",
+        1
+      ],
+      "crop": "disabled",
+      "image": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "ImageScale",
+    "_meta": {
+      "title": "Upscale Image"
+    }
+  },
+  "543": {
+    "inputs": {
+      "value": 1
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Generation resolution (MPX)"
+    }
+  }
+}

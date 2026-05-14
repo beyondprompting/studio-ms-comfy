@@ -46,6 +46,9 @@ class Settings:
     convex_worker_heartbeat_mutation: str = os.getenv(
         "CONVEX_WORKER_HEARTBEAT_MUTATION", "comfyJobs:heartbeatWorker"
     )
+    convex_get_job_status_query: str = os.getenv(
+        "CONVEX_GET_JOB_STATUS_QUERY", "comfyJobs:getJobStatus"
+    )
     worker_heartbeat_interval_seconds: float = float(
         os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "5.0")
     )

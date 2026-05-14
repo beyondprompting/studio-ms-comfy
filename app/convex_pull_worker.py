@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import math
+import copy
+import random
 import time
 import base64
 import threading
@@ -386,6 +388,7 @@ class ConvexPullWorker:
             "estuches_stage3_mask_composite": "estuches_stage3_mask_composite.json",
             "estuches_stage4_reimplant_feather": "estuches_stage4_reimplant_feather.json",
             "estuches_stage5_remove_bg_template": "estuches_stage5_remove_bg_template.json",
+            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.1.0.json",
         }
         mapped = {
             key: str(workflows_dir / filename)
@@ -463,6 +466,149 @@ class ConvexPullWorker:
             "resultHeight": int(image.height),
         }
         return output_path, image.width, image.height, timings
+
+    def _download_image_bytes(self, url: str, timeout: int = 120) -> bytes:
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        return response.content
+
+    @staticmethod
+    def _patch_load_image_node(
+        workflow: dict[str, Any],
+        node_id: str,
+        image_name: str,
+    ) -> None:
+        node = workflow.get(node_id)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            raise RuntimeError(f"Comfy workflow missing LoadImage node {node_id}")
+        node["inputs"]["image"] = image_name
+
+    @staticmethod
+    def _patch_lora_scale(
+        workflow: dict[str, Any],
+        index: int,
+        value: float,
+    ) -> None:
+        node = workflow.get("530")
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            return
+        inputs = node["inputs"]
+        for key in (
+            f"strength_{index}",
+            f"model_strength_{index}",
+            f"clip_strength_{index}",
+        ):
+            if key in inputs:
+                inputs[key] = value
+
+    def _build_qwen_comfy_workflow(
+        self,
+        job: ClaimedJob,
+        composite_bytes: bytes,
+    ) -> tuple[dict[str, Any], dict[str, int | float]]:
+        params = job.params if isinstance(job.params, dict) else {}
+        product_url = params.get("productUrl") if isinstance(params.get("productUrl"), str) else None
+        qwen_crop_url = params.get("qwenCropUrl") if isinstance(params.get("qwenCropUrl"), str) else None
+        mask_url = params.get("maskUrl") if isinstance(params.get("maskUrl"), str) else None
+
+        if not product_url or not qwen_crop_url or not mask_url:
+            raise RuntimeError("Qwen Comfy job missing productUrl, qwenCropUrl, or maskUrl")
+
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            product_future = executor.submit(self._download_image_bytes, product_url)
+            crop_future = executor.submit(self._download_image_bytes, qwen_crop_url)
+            mask_future = executor.submit(self._download_image_bytes, mask_url)
+            product_bytes = product_future.result()
+            crop_bytes = crop_future.result()
+            mask_bytes = mask_future.result()
+        download_inputs_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        t_upload = time.perf_counter()
+        uploaded_composite = self._comfy.upload_image_bytes(
+            composite_bytes,
+            f"{job.job_id}_qwen_composite.png",
+        )
+        uploaded_product = self._comfy.upload_image_bytes(
+            product_bytes,
+            f"{job.job_id}_product.png",
+        )
+        uploaded_crop = self._comfy.upload_image_bytes(
+            crop_bytes,
+            f"{job.job_id}_crop.png",
+        )
+        uploaded_mask = self._comfy.upload_image_bytes(
+            mask_bytes,
+            f"{job.job_id}_mask.png",
+        )
+        upload_inputs_ms = int(round((time.perf_counter() - t_upload) * 1000))
+
+        _, template = self._select_template(job)
+        workflow = copy.deepcopy(template)
+
+        self._patch_load_image_node(workflow, "523", uploaded_composite["name"])
+        self._patch_load_image_node(workflow, "524", uploaded_product["name"])
+        self._patch_load_image_node(workflow, "525", uploaded_crop["name"])
+        self._patch_load_image_node(workflow, "526", uploaded_mask["name"])
+
+        prompt = params.get("prompt") if isinstance(params.get("prompt"), str) else ""
+        negative_prompt = (
+            params.get("negativePrompt")
+            if isinstance(params.get("negativePrompt"), str)
+            else ""
+        )
+        seed = self._safe_int(params.get("seed"))
+        steps = self._safe_int(params.get("steps")) or 10
+        cfg = self._safe_float(params.get("cfg")) or 1.0
+        sampler_name = (
+            params.get("samplerName")
+            if params.get("samplerName") in {"dpmpp_2m_sde_gpu", "dpmpp_2m", "euler"}
+            else "dpmpp_2m_sde_gpu"
+        )
+        scheduler = (
+            params.get("scheduler")
+            if params.get("scheduler") in {"beta", "karras"}
+            else "beta"
+        )
+
+        workflow["28"]["inputs"]["prompt"] = prompt
+        workflow["12"]["inputs"]["prompt"] = negative_prompt
+        workflow["150"]["inputs"]["noise_seed"] = (
+            seed if seed is not None else random.randint(0, 2**31 - 1)
+        )
+        workflow["150"]["inputs"]["cfg"] = cfg
+        workflow["23"]["inputs"]["steps"] = steps
+        workflow["23"]["inputs"]["scheduler"] = scheduler
+        workflow["24"]["inputs"]["sampler_name"] = sampler_name
+        workflow["522"]["inputs"]["filename_prefix"] = f"Estuches-Qwen-{job.job_id}"
+
+        self._patch_lora_scale(
+            workflow,
+            1,
+            self._safe_float(params.get("estuchesLoraScale")) or 1.0,
+        )
+        self._patch_lora_scale(
+            workflow,
+            2,
+            self._safe_float(params.get("multiAnglesLoraScale")) or 1.0,
+        )
+        self._patch_lora_scale(
+            workflow,
+            3,
+            self._safe_float(params.get("lightningLoraScale")) or 1.0,
+        )
+
+        timings = {
+            "downloadInputsMs": download_inputs_ms,
+            "uploadInputsToComfyMs": upload_inputs_ms,
+            "promptLength": len(prompt),
+            "negativePromptLength": len(negative_prompt),
+            "steps": steps,
+            "cfg": cfg,
+            "samplerName": sampler_name,
+            "scheduler": scheduler,
+        }
+        return workflow, timings
 
     def _process_stage2_crop_pil(
         self,
@@ -932,6 +1078,17 @@ class ConvexPullWorker:
             # Event failures should not kill the run.
             print(f"[worker] append_event failed for {job_id}: {exc}")
 
+    def _is_job_canceled(self, job: ClaimedJob) -> bool:
+        try:
+            status = self._convex.query(
+                settings.convex_get_job_status_query,
+                {"jobId": job.job_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[worker] could not check cancellation for {job.job_id}: {exc}")
+            return False
+        return isinstance(status, dict) and status.get("status") == "canceled"
+
     def _process_claimed_job(self, job: ClaimedJob) -> None:
         with self._heartbeat_lock:
             self._current_job_id = job.job_id
@@ -972,6 +1129,118 @@ class ConvexPullWorker:
             )
 
             workflow_key = job.workflow_key or self._default_workflow_key
+
+            if workflow_key == "estuches_qwen_comfy":
+                self._emit_event(job.job_id, {"type": "qwen_comfy_started"})
+                t_build = time.perf_counter()
+                workflow, qwen_timings = self._build_qwen_comfy_workflow(job, input_bytes)
+                qwen_timings["buildWorkflowMs"] = int(round((time.perf_counter() - t_build) * 1000))
+
+                def relay_event(event: dict[str, Any]) -> None:
+                    if not self._should_emit_comfy_event(job.job_id, event):
+                        return
+                    self._emit_event(job.job_id, event)
+
+                t_comfy = time.perf_counter()
+                comfy_result = self._comfy.run_prompt_and_get_first_image(
+                    workflow,
+                    event_callback=relay_event,
+                    timeout_seconds=900,
+                )
+                qwen_timings["comfyMs"] = int(round((time.perf_counter() - t_comfy) * 1000))
+
+                if self._is_job_canceled(job):
+                    self._emit_event(
+                        job.job_id,
+                        {"type": "qwen_comfy_canceled_after_comfy"},
+                    )
+                    try:
+                        Path(comfy_result.output_file_path).unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] qwen comfy canceled output cleanup failed for {job.job_id}: {cleanup_exc}")
+                    return
+
+                result_w: int | None = None
+                result_h: int | None = None
+                try:
+                    with Image.open(comfy_result.output_file_path) as result_img:
+                        result_w = int(result_img.width)
+                        result_h = int(result_img.height)
+                except Exception as dim_exc:  # noqa: BLE001
+                    print(f"[worker] could not read qwen comfy result dimensions for {job.job_id}: {dim_exc}")
+
+                t_upload = time.perf_counter()
+                upload = self._convex.upload_file_to_convex(
+                    file_path=comfy_result.output_file_path,
+                    content_type="image/png",
+                    generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                )
+                qwen_timings["uploadResultMs"] = int(round((time.perf_counter() - t_upload) * 1000))
+
+                thumb_upload = None
+                thumb_path = self._create_thumbnail_file(
+                    source_path=comfy_result.output_file_path,
+                    job_id=job.job_id,
+                )
+                if thumb_path:
+                    thumb_upload = self._convex.upload_file_to_convex(
+                        file_path=str(thumb_path),
+                        content_type="image/jpeg",
+                        generate_upload_url_mutation=settings.convex_generate_upload_url_mutation,
+                    )
+                    self._emit_event(
+                        job.job_id,
+                        {
+                            "type": "thumbnail_uploaded",
+                            "thumbnailStorageId": thumb_upload["storageId"],
+                        },
+                    )
+                    try:
+                        thumb_path.unlink(missing_ok=True)
+                    except Exception as cleanup_exc:  # noqa: BLE001
+                        print(f"[worker] qwen comfy thumbnail cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                try:
+                    Path(comfy_result.output_file_path).unlink(missing_ok=True)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    print(f"[worker] qwen comfy result cleanup failed for {job.job_id}: {cleanup_exc}")
+
+                params = job.params if isinstance(job.params, dict) else {}
+                result_payload = {
+                    "promptId": comfy_result.prompt_id,
+                    "filename": comfy_result.output_filename,
+                    "subfolder": comfy_result.output_subfolder,
+                    "type": comfy_result.output_type,
+                    "workerId": settings.worker_id,
+                    "workflowKey": workflow_key,
+                    "processor": "comfy",
+                    "provider": "comfy",
+                    "resultWidth": result_w,
+                    "resultHeight": result_h,
+                    "thumbnailStorageId": thumb_upload["storageId"] if thumb_upload else None,
+                    "model": params.get("model"),
+                    "prompt": params.get("prompt"),
+                    "seed": params.get("seed"),
+                    "timings": qwen_timings,
+                }
+
+                self._convex.mark_job_completed(
+                    settings.convex_mark_completed_mutation,
+                    job_id=job.job_id,
+                    result_storage_id=upload["storageId"],
+                    result=result_payload,
+                )
+                self._emit_event(
+                    job.job_id,
+                    {
+                        "type": "job_completed",
+                        "resultStorageId": upload["storageId"],
+                        "resultWidth": result_w,
+                        "resultHeight": result_h,
+                        "processor": "comfy",
+                    },
+                )
+                return
 
             if workflow_key == "estuches_stage4_reimplant_feather":
                 self._emit_event(job.job_id, {"type": "stage4_reimplant_started"})
