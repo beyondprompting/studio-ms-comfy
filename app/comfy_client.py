@@ -22,6 +22,13 @@ class ComfyResult:
     output_type: str
 
 
+class ComfyPromptCanceled(RuntimeError):
+    def __init__(self, prompt_id: str, mode: str) -> None:
+        super().__init__(f"Comfy prompt canceled: {prompt_id} ({mode})")
+        self.prompt_id = prompt_id
+        self.mode = mode
+
+
 class ComfyClient:
     def __init__(self, base_url: str, output_dir: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -52,6 +59,22 @@ class ComfyClient:
         response.raise_for_status()
         return response.json()
 
+    def delete_queued_prompt(self, prompt_id: str) -> dict[str, Any]:
+        response = requests.post(self._http("/queue"), json={"delete": [prompt_id]}, timeout=30)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {"ok": True}
+
+    def interrupt_current_prompt(self) -> dict[str, Any]:
+        response = requests.post(self._http("/interrupt"), json={}, timeout=30)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {"ok": True}
+
     def get_history(self, prompt_id: str) -> dict[str, Any]:
         response = requests.get(self._http(f"/history/{prompt_id}"), timeout=30)
         response.raise_for_status()
@@ -67,6 +90,7 @@ class ComfyClient:
         self,
         prompt: dict[str, Any],
         event_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
         timeout_seconds: int = 600,
     ) -> ComfyResult:
         client_id = str(uuid.uuid4())
@@ -84,11 +108,36 @@ class ComfyClient:
             event_callback({"type": "comfy_prompt_queued", "prompt_id": prompt_id, "queue_response": queue_response})
 
         started = time.time()
+        last_cancel_check = 0.0
+        prompt_is_active = False
+        prompt_finished = False
 
         try:
             while True:
                 if time.time() - started > timeout_seconds:
                     raise TimeoutError(f"Comfy execution timeout after {timeout_seconds}s")
+
+                now = time.time()
+                if cancel_check and now - last_cancel_check >= 1.0:
+                    last_cancel_check = now
+                    if cancel_check():
+                        mode = "interrupt" if prompt_is_active and not prompt_finished else "queue_delete"
+                        cancel_response: dict[str, Any] | None = None
+                        if mode == "interrupt":
+                            cancel_response = self.interrupt_current_prompt()
+                        else:
+                            cancel_response = self.delete_queued_prompt(prompt_id)
+                        if event_callback:
+                            event_callback(
+                                {
+                                    "type": "comfy_prompt_cancel_requested",
+                                    "prompt_id": prompt_id,
+                                    "mode": mode,
+                                    "response": cancel_response,
+                                }
+                            )
+                        raise ComfyPromptCanceled(prompt_id, mode)
+
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
@@ -106,8 +155,18 @@ class ComfyClient:
                 if msg_type == "execution_error" and data.get("prompt_id") == prompt_id:
                     raise RuntimeError(f"Comfy execution_error: {data}")
 
+                if msg_type == "execution_start" and data.get("prompt_id") == prompt_id:
+                    prompt_is_active = True
+
                 if msg_type == "executing" and data.get("prompt_id") == prompt_id and data.get("node") is None:
+                    prompt_finished = True
                     break
+
+                if msg_type == "executing" and data.get("prompt_id") == prompt_id and data.get("node") is not None:
+                    prompt_is_active = True
+
+                if msg_type == "execution_success" and data.get("prompt_id") == prompt_id:
+                    prompt_finished = True
         finally:
             ws.close()
 

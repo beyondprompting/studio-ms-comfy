@@ -16,7 +16,7 @@ from typing import Any, Callable
 import requests
 from PIL import Image, ImageFilter
 
-from .comfy_client import ComfyClient
+from .comfy_client import ComfyClient, ComfyPromptCanceled
 from .config import settings
 from .convex_client import ClaimedJob, ConvexBridge, ConvexConfig
 from .workflow import build_workflow, load_workflow_template
@@ -792,6 +792,21 @@ class ConvexPullWorker:
         thumb_w = self._safe_float(params.get("thumbnailCanvasWidth"))
         thumb_h = self._safe_float(params.get("thumbnailCanvasHeight"))
         min_qwen_pixels = self._safe_int(params.get("qwenMinPixels")) or 1_000_000
+        composition_fingerprint = (
+            params.get("compositionFingerprint")
+            if isinstance(params.get("compositionFingerprint"), str)
+            else None
+        )
+        reusable_qwen_composite_image_id = (
+            params.get("reusableQwenCompositeImageId")
+            if isinstance(params.get("reusableQwenCompositeImageId"), str)
+            else None
+        )
+        reusable_qwen_crop_image_id = (
+            params.get("reusableQwenCropImageId")
+            if isinstance(params.get("reusableQwenCropImageId"), str)
+            else None
+        )
 
         with Image.open(BytesIO(input_bytes)) as crop_raw:
             crop = crop_raw.convert("RGBA")
@@ -828,15 +843,7 @@ class ConvexPullWorker:
         )
         mask_bounds = self._mask_bounds(mask_full)
 
-        silhouette_composite = crop.copy()
-        self._paste_center_alpha(
-            silhouette_composite,
-            self._white_silhouette(product_thumb),
-            product_center_x,
-            product_center_y,
-            product_full_w,
-            product_full_h,
-        )
+        should_reuse_qwen_composite = bool(reusable_qwen_composite_image_id)
 
         qwen_scale = 1.0
         crop_pixels = crop.width * crop.height
@@ -847,32 +854,45 @@ class ConvexPullWorker:
 
         if qwen_scale > 1.0001:
             qwen_crop = crop.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
-            qwen_composite = silhouette_composite.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
             qwen_mask = mask_full.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
         else:
             qwen_crop = crop
-            qwen_composite = silhouette_composite
             qwen_mask = mask_full
 
         output_dir = Path(settings.output_dir)
         paths = {
             "mask": output_dir / f"{job.job_id}_stage3_mask.png",
-            "qwenComposite": output_dir / f"{job.job_id}_stage3_qwen_composite.png",
         }
-        if qwen_scale > 1.0001:
+        if not should_reuse_qwen_composite:
+            silhouette_composite = crop.copy()
+            self._paste_center_alpha(
+                silhouette_composite,
+                self._white_silhouette(product_thumb),
+                product_center_x,
+                product_center_y,
+                product_full_w,
+                product_full_h,
+            )
+            if qwen_scale > 1.0001:
+                qwen_composite = silhouette_composite.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
+            else:
+                qwen_composite = silhouette_composite
+            paths["qwenComposite"] = output_dir / f"{job.job_id}_stage3_qwen_composite.png"
+        if qwen_scale > 1.0001 and not reusable_qwen_crop_image_id:
             paths["qwenCrop"] = output_dir / f"{job.job_id}_stage3_qwen_crop.png"
         mask_rgba = Image.merge("RGBA", (qwen_mask, qwen_mask, qwen_mask, Image.new("L", qwen_mask.size, 255)))
         self._encode_image(mask_rgba, paths["mask"], image_format="PNG")
-        self._encode_image(qwen_composite.convert("RGBA"), paths["qwenComposite"], image_format="PNG")
+        if "qwenComposite" in paths:
+            self._encode_image(qwen_composite.convert("RGBA"), paths["qwenComposite"], image_format="PNG")
         if "qwenCrop" in paths:
             self._encode_image(qwen_crop.convert("RGBA"), paths["qwenCrop"], image_format="PNG")
 
-        thumb_paths = {
-            "qwenComposite": self._create_thumbnail_file(
+        thumb_paths = {}
+        if "qwenComposite" in paths:
+            thumb_paths["qwenComposite"] = self._create_thumbnail_file(
                 str(paths["qwenComposite"]),
                 f"{job.job_id}_qwenComposite",
-            ),
-        }
+            )
 
         timings = {
             "downloadProductMs": download_product_ms,
@@ -887,6 +907,8 @@ class ConvexPullWorker:
             "productHeight": int(product_full_h),
             "thumbnailCanvasWidth": int(round(thumb_w)),
             "thumbnailCanvasHeight": int(round(thumb_h)),
+            "reusedQwenComposite": 1 if should_reuse_qwen_composite else 0,
+            "reusedQwenCrop": 1 if reusable_qwen_crop_image_id else 0,
         }
         return {
             "paths": paths,
@@ -894,6 +916,9 @@ class ConvexPullWorker:
             "maskBounds": mask_bounds,
             "timings": timings,
             "reusedSourceCrop": "qwenCrop" not in paths,
+            "qwenCompositeSourceImageId": reusable_qwen_composite_image_id,
+            "qwenCropSourceImageId": reusable_qwen_crop_image_id,
+            "compositionFingerprint": composition_fingerprint,
         }
 
     def _resolve_crop_region(self, job: ClaimedJob, width: int, height: int) -> tuple[int, int, int, int]:
@@ -1145,6 +1170,7 @@ class ConvexPullWorker:
                 comfy_result = self._comfy.run_prompt_and_get_first_image(
                     workflow,
                     event_callback=relay_event,
+                    cancel_check=lambda: self._is_job_canceled(job),
                     timeout_seconds=900,
                 )
                 qwen_timings["comfyMs"] = int(round((time.perf_counter() - t_comfy) * 1000))
@@ -1503,9 +1529,15 @@ class ConvexPullWorker:
                     "workflowKey": workflow_key,
                     "processor": "pil",
                     "maskStorageId": uploads["mask"]["storageId"],
-                    "qwenCompositeStorageId": uploads["qwenComposite"]["storageId"],
+                    "qwenCompositeStorageId": (
+                        uploads["qwenComposite"]["storageId"] if "qwenComposite" in uploads else None
+                    ),
+                    "qwenCompositeSourceImageId": stage3_result.get("qwenCompositeSourceImageId"),
                     "qwenCropStorageId": uploads["qwenCrop"]["storageId"] if "qwenCrop" in uploads else None,
-                    "qwenCropSourceImageId": job.source_image_id if stage3_result.get("reusedSourceCrop") else None,
+                    "qwenCropSourceImageId": (
+                        stage3_result.get("qwenCropSourceImageId")
+                        or (job.source_image_id if stage3_result.get("reusedSourceCrop") else None)
+                    ),
                     "qwenCompositeThumbnailStorageId": (
                         thumbnail_uploads["qwenComposite"]["storageId"]
                         if thumbnail_uploads.get("qwenComposite")
@@ -1516,19 +1548,25 @@ class ConvexPullWorker:
                     ),
                     "maskBounds": stage3_result["maskBounds"],
                     "timings": stage3_result["timings"],
+                    "compositionFingerprint": stage3_result.get("compositionFingerprint"),
                 }
+                result_storage_id = (
+                    uploads["qwenComposite"]["storageId"]
+                    if "qwenComposite" in uploads
+                    else uploads["mask"]["storageId"]
+                )
 
                 self._convex.mark_job_completed(
                     settings.convex_mark_completed_mutation,
                     job_id=job.job_id,
-                    result_storage_id=uploads["qwenComposite"]["storageId"],
+                    result_storage_id=result_storage_id,
                     result=result_payload,
                 )
                 self._emit_event(
                     job.job_id,
                     {
                         "type": "job_completed",
-                        "resultStorageId": uploads["qwenComposite"]["storageId"],
+                        "resultStorageId": result_storage_id,
                         "processor": "pil",
                     },
                 )
@@ -1721,6 +1759,16 @@ class ConvexPullWorker:
             )
             self._emit_event(job.job_id, {"type": "job_completed", "resultStorageId": upload["storageId"]})
 
+        except ComfyPromptCanceled as exc:
+            self._emit_event(
+                job.job_id,
+                {
+                    "type": "comfy_prompt_canceled",
+                    "promptId": exc.prompt_id,
+                    "mode": exc.mode,
+                },
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             err = {
                 "message": str(exc),
