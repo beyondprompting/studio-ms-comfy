@@ -1162,6 +1162,25 @@ class ConvexPullWorker:
                 qwen_timings["buildWorkflowMs"] = int(round((time.perf_counter() - t_build) * 1000))
 
                 def relay_event(event: dict[str, Any]) -> None:
+                    if event.get("type") == "comfy_ws_message" and event.get("message_type") == "progress":
+                        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                        value = data.get("value")
+                        maximum = data.get("max")
+                        prompt_id = data.get("prompt_id")
+                        if isinstance(value, (int, float)) and isinstance(maximum, (int, float)) and maximum > 0:
+                            bounded_value = max(0, min(float(value), float(maximum)))
+                            self._emit_event(
+                                job.job_id,
+                                {
+                                    "type": "qwen_comfy_progress",
+                                    "prompt_id": prompt_id,
+                                    "value": bounded_value,
+                                    "max": float(maximum),
+                                    "percent": round((bounded_value / float(maximum)) * 100),
+                                },
+                            )
+                        return
+
                     if not self._should_emit_comfy_event(job.job_id, event):
                         return
                     self._emit_event(job.job_id, event)
