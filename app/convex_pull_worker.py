@@ -31,7 +31,13 @@ QWEN_COMFY_MODEL_NAMES = {
     DEFAULT_QWEN_COMFY_MODEL_NAME,
     "Qwen-Image-Edit-2509-Q5_K_M.gguf",
     "qwen-image-edit-2511-Q4_K_M.gguf",
+    "qwen-image-edit-2511-Q5_K_M.gguf",
 }
+QWEN_COMFY_MULTI_ANGLES_LORA_NAME = "Qwen-Edit-2509-Multi-Angle-Lighting.safetensors"
+QWEN_COMFY_2509_ESTUCHES_LORA_NAME = "estuches/estuches_003-Qwen2509-5000.safetensors"
+QWEN_COMFY_2509_LIGHTNING_LORA_NAME = "Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors"
+QWEN_COMFY_2511_ESTUCHES_LORA_NAME = "estuches/estuches_003-Qwen2511_5000.safetensors"
+QWEN_COMFY_2511_LIGHTNING_LORA_NAME = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
 
 
 class ConvexPullWorker:
@@ -496,9 +502,24 @@ class ConvexPullWorker:
         node["inputs"]["image"] = image_name
 
     @staticmethod
-    def _patch_qwen_comfy_lora_scales(
+    def _get_qwen_comfy_lora_names(comfy_model_name: str) -> dict[str, str]:
+        if "2511" in comfy_model_name:
+            return {
+                "multiAngles": QWEN_COMFY_MULTI_ANGLES_LORA_NAME,
+                "estuches": QWEN_COMFY_2511_ESTUCHES_LORA_NAME,
+                "lightning": QWEN_COMFY_2511_LIGHTNING_LORA_NAME,
+            }
+        return {
+            "multiAngles": QWEN_COMFY_MULTI_ANGLES_LORA_NAME,
+            "estuches": QWEN_COMFY_2509_ESTUCHES_LORA_NAME,
+            "lightning": QWEN_COMFY_2509_LIGHTNING_LORA_NAME,
+        }
+
+    @staticmethod
+    def _patch_qwen_comfy_loras(
         workflow: dict[str, Any],
         *,
+        lora_names: dict[str, str],
         multi_angles_scale: float,
         estuches_scale: float,
         lightning_scale: float,
@@ -507,13 +528,17 @@ class ConvexPullWorker:
         if not isinstance(stack_node, dict) or not isinstance(stack_node.get("inputs"), dict):
             raise RuntimeError("Qwen Comfy v1.2 workflow missing LoRA stack node 563")
         stack_inputs = stack_node["inputs"]
+        stack_inputs["lora_name_1"] = lora_names["multiAngles"]
         stack_inputs["model_weight_1"] = multi_angles_scale
+        stack_inputs["lora_name_2"] = lora_names["estuches"]
         stack_inputs["model_weight_2"] = estuches_scale
 
         lightning_node = workflow.get("548")
         if not isinstance(lightning_node, dict) or not isinstance(lightning_node.get("inputs"), dict):
             raise RuntimeError("Qwen Comfy v1.2 workflow missing Lightning LoRA node 548")
-        lightning_node["inputs"]["strength_model"] = lightning_scale
+        lightning_inputs = lightning_node["inputs"]
+        lightning_inputs["lora_name"] = lora_names["lightning"]
+        lightning_inputs["strength_model"] = lightning_scale
 
     def _build_qwen_comfy_workflow(
         self,
@@ -620,8 +645,10 @@ class ConvexPullWorker:
         if lightning_lora_scale is None:
             lightning_lora_scale = DEFAULT_QWEN_COMFY_LIGHTNING_LORA_SCALE
 
-        self._patch_qwen_comfy_lora_scales(
+        lora_names = self._get_qwen_comfy_lora_names(comfy_model_name)
+        self._patch_qwen_comfy_loras(
             workflow,
+            lora_names=lora_names,
             multi_angles_scale=multi_angles_lora_scale,
             estuches_scale=estuches_lora_scale,
             lightning_scale=lightning_lora_scale,
@@ -639,6 +666,12 @@ class ConvexPullWorker:
             "comfyModelName": comfy_model_name,
             "resolutionMegapixels": resolution_megapixels,
             "samplingShift": sampling_shift,
+            "loraMultiAnglesName": lora_names["multiAngles"],
+            "loraEstuchesName": lora_names["estuches"],
+            "loraLightningName": lora_names["lightning"],
+            "loraMultiAnglesScale": multi_angles_lora_scale,
+            "loraEstuchesScale": estuches_lora_scale,
+            "loraLightningScale": lightning_lora_scale,
         }
         return workflow, timings
 
