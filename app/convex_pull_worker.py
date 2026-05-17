@@ -22,6 +22,11 @@ from .convex_client import ClaimedJob, ConvexBridge, ConvexConfig
 from .workflow import build_workflow, load_workflow_template
 
 DEFAULT_QWEN_COMFY_MODEL_NAME = "Qwen-Image-Edit-2509-Q4_K_M.gguf"
+DEFAULT_QWEN_COMFY_RESOLUTION_MEGAPIXELS = 1.0
+DEFAULT_QWEN_COMFY_SAMPLING_SHIFT = 3.5
+DEFAULT_QWEN_COMFY_MULTI_ANGLES_LORA_SCALE = 0.9
+DEFAULT_QWEN_COMFY_ESTUCHES_LORA_SCALE = 0.9
+DEFAULT_QWEN_COMFY_LIGHTNING_LORA_SCALE = 1.0
 QWEN_COMFY_MODEL_NAMES = {
     DEFAULT_QWEN_COMFY_MODEL_NAME,
     "Qwen-Image-Edit-2509-Q5_K_M.gguf",
@@ -395,7 +400,7 @@ class ConvexPullWorker:
             "estuches_stage3_mask_composite": "estuches_stage3_mask_composite.json",
             "estuches_stage4_reimplant_feather": "estuches_stage4_reimplant_feather.json",
             "estuches_stage5_remove_bg_template": "estuches_stage5_remove_bg_template.json",
-            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.1.0.json",
+            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.2.0.json",
         }
         mapped = {
             key: str(workflows_dir / filename)
@@ -491,22 +496,24 @@ class ConvexPullWorker:
         node["inputs"]["image"] = image_name
 
     @staticmethod
-    def _patch_lora_scale(
+    def _patch_qwen_comfy_lora_scales(
         workflow: dict[str, Any],
-        index: int,
-        value: float,
+        *,
+        multi_angles_scale: float,
+        estuches_scale: float,
+        lightning_scale: float,
     ) -> None:
-        node = workflow.get("530")
-        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
-            return
-        inputs = node["inputs"]
-        for key in (
-            f"strength_{index}",
-            f"model_strength_{index}",
-            f"clip_strength_{index}",
-        ):
-            if key in inputs:
-                inputs[key] = value
+        stack_node = workflow.get("563")
+        if not isinstance(stack_node, dict) or not isinstance(stack_node.get("inputs"), dict):
+            raise RuntimeError("Qwen Comfy v1.2 workflow missing LoRA stack node 563")
+        stack_inputs = stack_node["inputs"]
+        stack_inputs["model_weight_1"] = multi_angles_scale
+        stack_inputs["model_weight_2"] = estuches_scale
+
+        lightning_node = workflow.get("548")
+        if not isinstance(lightning_node, dict) or not isinstance(lightning_node.get("inputs"), dict):
+            raise RuntimeError("Qwen Comfy v1.2 workflow missing Lightning LoRA node 548")
+        lightning_node["inputs"]["strength_model"] = lightning_scale
 
     def _build_qwen_comfy_workflow(
         self,
@@ -582,6 +589,12 @@ class ConvexPullWorker:
             if params.get("comfyModelName") in QWEN_COMFY_MODEL_NAMES
             else DEFAULT_QWEN_COMFY_MODEL_NAME
         )
+        resolution_megapixels = self._safe_float(params.get("resolutionMegapixels"))
+        if resolution_megapixels is None or resolution_megapixels <= 0:
+            resolution_megapixels = DEFAULT_QWEN_COMFY_RESOLUTION_MEGAPIXELS
+        sampling_shift = self._safe_float(params.get("samplingShift"))
+        if sampling_shift is None or sampling_shift <= 0:
+            sampling_shift = DEFAULT_QWEN_COMFY_SAMPLING_SHIFT
 
         workflow["28"]["inputs"]["prompt"] = prompt
         workflow["12"]["inputs"]["prompt"] = negative_prompt
@@ -593,22 +606,25 @@ class ConvexPullWorker:
         workflow["23"]["inputs"]["steps"] = steps
         workflow["23"]["inputs"]["scheduler"] = scheduler
         workflow["24"]["inputs"]["sampler_name"] = sampler_name
+        workflow["543"]["inputs"]["value"] = resolution_megapixels
+        workflow["5"]["inputs"]["shift"] = sampling_shift
         workflow["522"]["inputs"]["filename_prefix"] = f"Estuches-Qwen-{job.job_id}"
 
-        self._patch_lora_scale(
+        estuches_lora_scale = self._safe_float(params.get("estuchesLoraScale"))
+        if estuches_lora_scale is None:
+            estuches_lora_scale = DEFAULT_QWEN_COMFY_ESTUCHES_LORA_SCALE
+        multi_angles_lora_scale = self._safe_float(params.get("multiAnglesLoraScale"))
+        if multi_angles_lora_scale is None:
+            multi_angles_lora_scale = DEFAULT_QWEN_COMFY_MULTI_ANGLES_LORA_SCALE
+        lightning_lora_scale = self._safe_float(params.get("lightningLoraScale"))
+        if lightning_lora_scale is None:
+            lightning_lora_scale = DEFAULT_QWEN_COMFY_LIGHTNING_LORA_SCALE
+
+        self._patch_qwen_comfy_lora_scales(
             workflow,
-            1,
-            self._safe_float(params.get("estuchesLoraScale")) or 1.0,
-        )
-        self._patch_lora_scale(
-            workflow,
-            2,
-            self._safe_float(params.get("multiAnglesLoraScale")) or 1.0,
-        )
-        self._patch_lora_scale(
-            workflow,
-            3,
-            self._safe_float(params.get("lightningLoraScale")) or 1.0,
+            multi_angles_scale=multi_angles_lora_scale,
+            estuches_scale=estuches_lora_scale,
+            lightning_scale=lightning_lora_scale,
         )
 
         timings = {
@@ -621,6 +637,8 @@ class ConvexPullWorker:
             "samplerName": sampler_name,
             "scheduler": scheduler,
             "comfyModelName": comfy_model_name,
+            "resolutionMegapixels": resolution_megapixels,
+            "samplingShift": sampling_shift,
         }
         return workflow, timings
 
