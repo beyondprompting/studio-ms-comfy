@@ -406,7 +406,7 @@ class ConvexPullWorker:
             "estuches_stage3_mask_composite": "estuches_stage3_mask_composite.json",
             "estuches_stage4_reimplant_feather": "estuches_stage4_reimplant_feather.json",
             "estuches_stage5_remove_bg_template": "estuches_stage5_remove_bg_template.json",
-            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.2.0.json",
+            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.3.0.json",
         }
         mapped = {
             key: str(workflows_dir / filename)
