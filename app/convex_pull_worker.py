@@ -406,7 +406,7 @@ class ConvexPullWorker:
             "estuches_stage3_mask_composite": "estuches_stage3_mask_composite.json",
             "estuches_stage4_reimplant_feather": "estuches_stage4_reimplant_feather.json",
             "estuches_stage5_remove_bg_template": "estuches_stage5_remove_bg_template.json",
-            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.4.0.json",
+            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.5.0.json",
         }
         mapped = {
             key: str(workflows_dir / filename)
@@ -784,12 +784,15 @@ class ConvexPullWorker:
         center_y: float,
         width: int,
         height: int,
+        rotation: float = 0.0,
     ) -> None:
         if width <= 0 or height <= 0:
             return
         resized = overlay.resize((width, height), Image.Resampling.LANCZOS)
-        x = int(round(center_x - width / 2))
-        y = int(round(center_y - height / 2))
+        if rotation:
+            resized = resized.rotate(-rotation, resample=Image.Resampling.BICUBIC, expand=True)
+        x = int(round(center_x - resized.width / 2))
+        y = int(round(center_y - resized.height / 2))
         base.alpha_composite(resized, (x, y))
 
     @staticmethod
@@ -800,13 +803,18 @@ class ConvexPullWorker:
         center_y: float,
         width: int,
         height: int,
+        rotation: float = 0.0,
     ) -> None:
         if width <= 0 or height <= 0:
             return
         alpha = product.getchannel("A").resize((width, height), Image.Resampling.LANCZOS)
+        if rotation:
+            alpha = alpha.rotate(-rotation, resample=Image.Resampling.BICUBIC, expand=True)
         black_shape = Image.new("L", (width, height), 0)
-        x = int(round(center_x - width / 2))
-        y = int(round(center_y - height / 2))
+        if black_shape.size != alpha.size:
+            black_shape = Image.new("L", alpha.size, 0)
+        x = int(round(center_x - alpha.width / 2))
+        y = int(round(center_y - alpha.height / 2))
         mask_l.paste(black_shape, (x, y), alpha)
 
     @staticmethod
@@ -854,6 +862,7 @@ class ConvexPullWorker:
         product_x = self._safe_float(product_position.get("x")) or 0.0
         product_y = self._safe_float(product_position.get("y")) or 0.0
         product_scale = self._safe_float(params.get("productScale")) or 1.0
+        product_rotation = self._safe_float(params.get("productRotation")) or 0.0
         thumb_w = self._safe_float(params.get("thumbnailCanvasWidth"))
         thumb_h = self._safe_float(params.get("thumbnailCanvasHeight"))
         min_qwen_pixels = self._safe_int(params.get("qwenMinPixels")) or 1_000_000
@@ -905,6 +914,7 @@ class ConvexPullWorker:
             product_center_y,
             product_full_w,
             product_full_h,
+            product_rotation,
         )
         mask_bounds = self._mask_bounds(mask_full)
 
@@ -937,6 +947,7 @@ class ConvexPullWorker:
                 product_center_y,
                 product_full_w,
                 product_full_h,
+                product_rotation,
             )
             if qwen_scale > 1.0001:
                 qwen_composite = silhouette_composite.resize((qwen_w, qwen_h), Image.Resampling.LANCZOS)
@@ -970,6 +981,7 @@ class ConvexPullWorker:
             "reusedSourceCrop": 0 if "qwenCrop" in paths else 1,
             "productWidth": int(product_full_w),
             "productHeight": int(product_full_h),
+            "productRotation": float(product_rotation),
             "thumbnailCanvasWidth": int(round(thumb_w)),
             "thumbnailCanvasHeight": int(round(thumb_h)),
             "reusedQwenComposite": 1 if should_reuse_qwen_composite else 0,
