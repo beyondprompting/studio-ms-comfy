@@ -69,6 +69,8 @@ class ConvexPullWorker:
         if self._default_workflow_key not in self._templates:
             self._default_workflow_key = next(iter(self._templates))
         self._source_image_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+        self._comfy_input_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._comfy_input_cache_lock = threading.Lock()
         self._ws_event_counters: dict[str, int] = {}
         self._running = False
         self._heartbeat_thread: threading.Thread | None = None
@@ -119,6 +121,70 @@ class ConvexPullWorker:
         self._source_image_cache.move_to_end(source_url)
         self._purge_source_cache(now)
         return data, False
+
+    def _purge_comfy_input_cache(self, now: float) -> None:
+        ttl = max(settings.worker_comfy_input_cache_ttl_seconds, 0)
+        if ttl == 0:
+            self._comfy_input_cache.clear()
+            return
+
+        expired_keys = [
+            key
+            for key, (uploaded_at, _upload) in self._comfy_input_cache.items()
+            if now - uploaded_at > ttl
+        ]
+        for key in expired_keys:
+            self._comfy_input_cache.pop(key, None)
+
+        max_entries = max(settings.worker_comfy_input_cache_max_entries, 1)
+        while len(self._comfy_input_cache) > max_entries:
+            self._comfy_input_cache.popitem(last=False)
+
+    def _get_or_upload_comfy_input(
+        self,
+        *,
+        asset_key: str,
+        filename: str,
+        image_bytes: bytes | None = None,
+        source_url: str | None = None,
+    ) -> tuple[dict[str, Any], bool, bool, int, int]:
+        if not asset_key:
+            raise RuntimeError("Comfy input cache key is required")
+
+        if settings.worker_comfy_input_cache_enabled:
+            now = time.time()
+            with self._comfy_input_cache_lock:
+                self._purge_comfy_input_cache(now)
+                cached = self._comfy_input_cache.get(asset_key)
+                if cached is not None:
+                    uploaded_at, upload = cached
+                    self._comfy_input_cache.move_to_end(asset_key)
+                    if now - uploaded_at <= max(settings.worker_comfy_input_cache_ttl_seconds, 0):
+                        return upload, True, False, 0, 0
+                    self._comfy_input_cache.pop(asset_key, None)
+
+        downloaded = False
+        download_ms = 0
+        if image_bytes is None:
+            if not source_url:
+                raise RuntimeError("Comfy input upload requires bytes or source_url")
+            t_download = time.perf_counter()
+            image_bytes = self._download_image_bytes(source_url)
+            download_ms = int(round((time.perf_counter() - t_download) * 1000))
+            downloaded = True
+
+        t_upload = time.perf_counter()
+        upload = self._comfy.upload_image_bytes(image_bytes, filename)
+        upload_ms = int(round((time.perf_counter() - t_upload) * 1000))
+
+        if settings.worker_comfy_input_cache_enabled:
+            now = time.time()
+            with self._comfy_input_cache_lock:
+                self._comfy_input_cache[asset_key] = (now, upload)
+                self._comfy_input_cache.move_to_end(asset_key)
+                self._purge_comfy_input_cache(now)
+
+        return upload, False, downloaded, download_ms, upload_ms
 
     def _should_emit_comfy_event(self, job_id: str, event: dict[str, Any]) -> bool:
         if settings.worker_emit_all_comfy_events:
@@ -406,7 +472,7 @@ class ConvexPullWorker:
             "estuches_stage3_mask_composite": "estuches_stage3_mask_composite.json",
             "estuches_stage4_reimplant_feather": "estuches_stage4_reimplant_feather.json",
             "estuches_stage5_remove_bg_template": "estuches_stage5_remove_bg_template.json",
-            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.5.0.json",
+            "estuches_qwen_comfy": "Estuches-Qwen-Worker.v1.4.0.json",
         }
         mapped = {
             key: str(workflows_dir / filename)
@@ -544,7 +610,7 @@ class ConvexPullWorker:
         self,
         job: ClaimedJob,
         composite_bytes: bytes,
-    ) -> tuple[dict[str, Any], dict[str, int | float]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         params = job.params if isinstance(job.params, dict) else {}
         product_url = params.get("productUrl") if isinstance(params.get("productUrl"), str) else None
         qwen_crop_url = params.get("qwenCropUrl") if isinstance(params.get("qwenCropUrl"), str) else None
@@ -553,34 +619,55 @@ class ConvexPullWorker:
         if not product_url or not qwen_crop_url or not mask_url:
             raise RuntimeError("Qwen Comfy job missing productUrl, qwenCropUrl, or maskUrl")
 
-        t0 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            product_future = executor.submit(self._download_image_bytes, product_url)
-            crop_future = executor.submit(self._download_image_bytes, qwen_crop_url)
-            mask_future = executor.submit(self._download_image_bytes, mask_url)
-            product_bytes = product_future.result()
-            crop_bytes = crop_future.result()
-            mask_bytes = mask_future.result()
-        download_inputs_ms = int(round((time.perf_counter() - t0) * 1000))
+        qwen_composite_url = (
+            params.get("qwenCompositeUrl")
+            if isinstance(params.get("qwenCompositeUrl"), str)
+            else job.source_image_url
+        )
+        if not qwen_composite_url:
+            raise RuntimeError("Qwen Comfy job missing qwenCompositeUrl")
 
-        t_upload = time.perf_counter()
-        uploaded_composite = self._comfy.upload_image_bytes(
-            composite_bytes,
-            f"{job.job_id}_qwen_composite.png",
-        )
-        uploaded_product = self._comfy.upload_image_bytes(
-            product_bytes,
-            f"{job.job_id}_product.png",
-        )
-        uploaded_crop = self._comfy.upload_image_bytes(
-            crop_bytes,
-            f"{job.job_id}_crop.png",
-        )
-        uploaded_mask = self._comfy.upload_image_bytes(
-            mask_bytes,
-            f"{job.job_id}_mask.png",
-        )
-        upload_inputs_ms = int(round((time.perf_counter() - t_upload) * 1000))
+        input_specs = {
+            "composite": {
+                "asset_key": f"qwen-composite:{qwen_composite_url}",
+                "filename": f"{job.job_id}_qwen_composite.png",
+                "image_bytes": composite_bytes,
+            },
+            "product": {
+                "asset_key": f"product:{product_url}",
+                "filename": f"{job.job_id}_product.png",
+                "source_url": product_url,
+            },
+            "crop": {
+                "asset_key": f"qwen-crop:{qwen_crop_url}",
+                "filename": f"{job.job_id}_crop.png",
+                "source_url": qwen_crop_url,
+            },
+            "mask": {
+                "asset_key": f"mask:{mask_url}",
+                "filename": f"{job.job_id}_mask.png",
+                "source_url": mask_url,
+            },
+        }
+
+        t_prepare_inputs = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            input_futures = {
+                key: executor.submit(self._get_or_upload_comfy_input, **spec)
+                for key, spec in input_specs.items()
+            }
+            input_results = {
+                key: future.result()
+                for key, future in input_futures.items()
+            }
+        prepare_inputs_ms = int(round((time.perf_counter() - t_prepare_inputs) * 1000))
+
+        uploaded_composite = input_results["composite"][0]
+        uploaded_product = input_results["product"][0]
+        uploaded_crop = input_results["crop"][0]
+        uploaded_mask = input_results["mask"][0]
+        download_inputs_ms = sum(result[3] for result in input_results.values())
+        upload_inputs_ms = sum(result[4] for result in input_results.values())
 
         _, template = self._select_template(job)
         workflow = copy.deepcopy(template)
@@ -657,6 +744,13 @@ class ConvexPullWorker:
         timings = {
             "downloadInputsMs": download_inputs_ms,
             "uploadInputsToComfyMs": upload_inputs_ms,
+            "prepareInputsMs": prepare_inputs_ms,
+            "comfyInputCacheHits": {
+                key: bool(result[1]) for key, result in input_results.items()
+            },
+            "comfyInputDownloaded": {
+                key: bool(result[2]) for key, result in input_results.items()
+            },
             "promptLength": len(prompt),
             "negativePromptLength": len(negative_prompt),
             "steps": steps,
