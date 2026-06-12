@@ -30,7 +30,7 @@
   },
   "5": {
     "inputs": {
-      "shift": 4,
+      "shift": 3,
       "model": [
         "564",
         0
@@ -163,7 +163,7 @@
         0
       ],
       "mask": [
-        "532",
+        "565",
         0
       ]
     },
@@ -184,7 +184,7 @@
   "150": {
     "inputs": {
       "add_noise": true,
-      "noise_seed": 6323694558,
+      "noise_seed": 543720336324255,
       "cfg": 1,
       "model": [
         "4",
@@ -218,7 +218,7 @@
   },
   "522": {
     "inputs": {
-      "filename_prefix": "Estuches-Qwen-q1721tyzdn6s9y37jk85dy7n4x87webr",
+      "filename_prefix": "Estuches-Qwen-q178z0a3440yzbaj773x4pn5nd87zd44",
       "images": [
         "542",
         0
@@ -231,7 +231,7 @@
   },
   "523": {
     "inputs": {
-      "image": "q1721tyzdn6s9y37jk85dy7n4x87webr_qwen_composite.png"
+      "image": "q17bnpy3z9b85gk81p75j8dbe188cr7g_qwen_composite.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -240,7 +240,7 @@
   },
   "524": {
     "inputs": {
-      "image": "q1721tyzdn6s9y37jk85dy7n4x87webr_product.png"
+      "image": "q177hqy7rnw27jqdgn5wmfkj6d88d3mt_product.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -249,7 +249,7 @@
   },
   "525": {
     "inputs": {
-      "image": "q1721tyzdn6s9y37jk85dy7n4x87webr_crop.png"
+      "image": "q17bnpy3z9b85gk81p75j8dbe188cr7g_crop.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -258,7 +258,7 @@
   },
   "526": {
     "inputs": {
-      "image": "q1721tyzdn6s9y37jk85dy7n4x87webr_mask.png"
+      "image": "q17bnpy3z9b85gk81p75j8dbe188cr7g_mask.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -319,6 +319,7 @@
   },
   "541": {
     "inputs": {
+      "$$node-text-preview": "width: 3072, height: 1997\n batch size: 1",
       "image": [
         "525",
         0
@@ -363,7 +364,7 @@
   "548": {
     "inputs": {
       "lora_name": "Qwen-Image-Edit-2509-Lightning-8steps-V1.0-bf16.safetensors",
-      "strength_model": 1,
+      "strength_model": 0.5,
       "model": [
         "35",
         0
@@ -378,11 +379,11 @@
     "inputs": {
       "switch_1": "On",
       "lora_name_1": "Qwen-Edit-2509-Multi-Angle-Lighting.safetensors",
-      "model_weight_1": 0.9,
+      "model_weight_1": 0.8,
       "clip_weight_1": 0,
       "switch_2": "On",
       "lora_name_2": "estuches/estuches_003-Qwen2509-5000.safetensors",
-      "model_weight_2": 0.9,
+      "model_weight_2": 1,
       "clip_weight_2": 0,
       "switch_3": "Off",
       "lora_name_3": "None",
@@ -412,6 +413,35 @@
     "class_type": "CR Apply LoRA Stack",
     "_meta": {
       "title": "💊 CR Apply LoRA Stack"
+    }
+  },
+  "565": {
+    "inputs": {
+      "erode_dilate": -24,
+      "fill_holes": 1,
+      "remove_isolated_pixels": 1,
+      "smooth": 0,
+      "blur": 8,
+      "mask": [
+        "532",
+        0
+      ]
+    },
+    "class_type": "MaskFix+",
+    "_meta": {
+      "title": "🔧 Mask Fix"
+    }
+  },
+  "566": {
+    "inputs": {
+      "images": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
     }
   }
 }
