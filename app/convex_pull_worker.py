@@ -863,8 +863,25 @@ class ConvexPullWorker:
         return resized.resize(next_size, Image.Resampling.LANCZOS)
 
     @staticmethod
-    def _white_silhouette(product: Image.Image) -> Image.Image:
-        silhouette = Image.new("RGBA", product.size, (255, 255, 255, 0))
+    def _normalize_hex_color(value: Any, fallback: str = "#ffffff") -> str:
+        if not isinstance(value, str):
+            return fallback
+        color = value.strip()
+        if len(color) != 7 or color[0] != "#":
+            return fallback
+        try:
+            int(color[1:], 16)
+        except ValueError:
+            return fallback
+        return color.lower()
+
+    @staticmethod
+    def _solid_silhouette(product: Image.Image, color: str = "#ffffff") -> Image.Image:
+        safe_color = ConvexPullWorker._normalize_hex_color(color)
+        r = int(safe_color[1:3], 16)
+        g = int(safe_color[3:5], 16)
+        b = int(safe_color[5:7], 16)
+        silhouette = Image.new("RGBA", product.size, (r, g, b, 0))
         alpha = product.getchannel("A")
         solid_alpha = alpha.point(lambda p: 255 if p > 128 else 0)
         silhouette.putalpha(solid_alpha)
@@ -957,6 +974,7 @@ class ConvexPullWorker:
         product_y = self._safe_float(product_position.get("y")) or 0.0
         product_scale = self._safe_float(params.get("productScale")) or 1.0
         product_rotation = self._safe_float(params.get("productRotation")) or 0.0
+        silhouette_color = self._normalize_hex_color(params.get("silhouetteColor"))
         thumb_w = self._safe_float(params.get("thumbnailCanvasWidth"))
         thumb_h = self._safe_float(params.get("thumbnailCanvasHeight"))
         min_qwen_pixels = self._safe_int(params.get("qwenMinPixels")) or 1_000_000
@@ -1036,7 +1054,7 @@ class ConvexPullWorker:
             silhouette_composite = crop.copy()
             self._paste_center_alpha(
                 silhouette_composite,
-                self._white_silhouette(product_thumb),
+                self._solid_silhouette(product_thumb, silhouette_color),
                 product_center_x,
                 product_center_y,
                 product_full_w,
