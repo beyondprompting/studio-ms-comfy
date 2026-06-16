@@ -319,7 +319,6 @@
   },
   "541": {
     "inputs": {
-      "$$node-text-preview": "width: 3072, height: 1997\n batch size: 1",
       "image": [
         "525",
         0
@@ -417,11 +416,11 @@
   },
   "565": {
     "inputs": {
-      "erode_dilate": -24,
+      "erode_dilate": -8,
       "fill_holes": 1,
       "remove_isolated_pixels": 1,
       "smooth": 0,
-      "blur": 8,
+      "blur": 32,
       "mask": [
         "532",
         0
@@ -430,18 +429,6 @@
     "class_type": "MaskFix+",
     "_meta": {
       "title": "🔧 Mask Fix"
-    }
-  },
-  "566": {
-    "inputs": {
-      "images": [
-        "3",
-        0
-      ]
-    },
-    "class_type": "PreviewImage",
-    "_meta": {
-      "title": "Preview Image"
     }
   }
 }
