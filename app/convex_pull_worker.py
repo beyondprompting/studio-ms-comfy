@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import requests
-from PIL import Image, ImageFilter
+from PIL import Image, ImageCms, ImageFilter
 
 from .comfy_client import ComfyClient, ComfyPromptCanceled
 from .config import settings
@@ -514,6 +514,37 @@ class ConvexPullWorker:
             save_kwargs.update({"optimize": False, "compress_level": 1})
         image.save(output_path, **save_kwargs)
 
+    @staticmethod
+    def _get_image_color_info(image: Image.Image) -> dict[str, Any]:
+        bands = list(image.getbands())
+        mode = image.mode
+        is_cmyk = mode == "CMYK" or any(band.upper() == "K" for band in bands)
+        return {
+            "sourceColorMode": mode,
+            "sourceColorBands": bands,
+            "sourceIsCmyk": is_cmyk,
+            "sourceHasIccProfile": bool(image.info.get("icc_profile")),
+            "sourceOriginalWidth": int(image.width),
+            "sourceOriginalHeight": int(image.height),
+        }
+
+    @staticmethod
+    def _convert_image_to_srgb(image: Image.Image) -> Image.Image:
+        icc_profile = image.info.get("icc_profile")
+        if icc_profile:
+            try:
+                source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
+                srgb_profile = ImageCms.createProfile("sRGB")
+                return ImageCms.profileToProfile(
+                    image,
+                    source_profile,
+                    srgb_profile,
+                    outputMode="RGB",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[worker] ICC color conversion failed, falling back to RGB convert: {exc}")
+        return image.convert("RGB")
+
     def _create_thumbnail_file_from_image(self, image: Image.Image, job_id: str) -> Path:
         thumb_path = Path(settings.output_dir) / f"{job_id}_thumb.jpg"
         thumbnail = image.convert("RGB")
@@ -525,10 +556,11 @@ class ConvexPullWorker:
         self,
         job: ClaimedJob,
         input_bytes: bytes,
-    ) -> tuple[Path, int, int, dict[str, int]]:
+    ) -> tuple[Path, int, int, dict[str, Any]]:
         t0 = time.perf_counter()
         with Image.open(BytesIO(input_bytes)) as src:
-            image = src.convert("RGB")
+            color_info = self._get_image_color_info(src)
+            image = self._convert_image_to_srgb(src)
         load_ms = int(round((time.perf_counter() - t0) * 1000))
 
         t_resize = time.perf_counter()
@@ -548,6 +580,34 @@ class ConvexPullWorker:
             "outputBytes": int(output_path.stat().st_size if output_path.exists() else 0),
             "resultWidth": int(image.width),
             "resultHeight": int(image.height),
+            **color_info,
+        }
+        return output_path, image.width, image.height, timings
+
+    def _process_stage1_rgb_conversion_pil(
+        self,
+        job: ClaimedJob,
+        input_bytes: bytes,
+    ) -> tuple[Path, int, int, dict[str, Any]]:
+        t0 = time.perf_counter()
+        with Image.open(BytesIO(input_bytes)) as src:
+            color_info = self._get_image_color_info(src)
+            image = self._convert_image_to_srgb(src)
+        load_ms = int(round((time.perf_counter() - t0) * 1000))
+
+        output_path = Path(settings.output_dir) / f"{job.job_id}_rgb.jpg"
+        t_encode = time.perf_counter()
+        self._encode_image(image, output_path, image_format="JPEG", quality=95)
+        encode_ms = int(round((time.perf_counter() - t_encode) * 1000))
+
+        timings = {
+            "loadMs": load_ms,
+            "encodeMs": encode_ms,
+            "totalMs": int(round((time.perf_counter() - t0) * 1000)),
+            "outputBytes": int(output_path.stat().st_size if output_path.exists() else 0),
+            "resultWidth": int(image.width),
+            "resultHeight": int(image.height),
+            **color_info,
         }
         return output_path, image.width, image.height, timings
 
@@ -1562,18 +1622,26 @@ class ConvexPullWorker:
                 return
 
             if workflow_key == "estuches_stage1_resize_image_mask_node":
-                self._emit_event(job.job_id, {"type": "stage1_thumbnail_pil_started"})
-                result_path, result_w, result_h, stage1_timings = self._process_stage1_thumbnail_pil(
-                    job,
-                    input_bytes,
-                )
-                self._emit_event(
-                    job.job_id,
-                    {
-                        "type": "stage1_thumbnail_pil_timing",
-                        **stage1_timings,
-                    },
-                )
+                params = job.params if isinstance(job.params, dict) else {}
+                color_mode_task = params.get("caseColorModeTask")
+                is_rgb_conversion = color_mode_task == "convert-original-to-rgb"
+
+                if is_rgb_conversion:
+                    self._emit_event(job.job_id, {"type": "stage1_rgb_conversion_pil_started"})
+                    result_path, result_w, result_h, stage1_timings = self._process_stage1_rgb_conversion_pil(
+                        job,
+                        input_bytes,
+                    )
+                    event_type = "stage1_rgb_conversion_pil_timing"
+                else:
+                    self._emit_event(job.job_id, {"type": "stage1_thumbnail_pil_started"})
+                    result_path, result_w, result_h, stage1_timings = self._process_stage1_thumbnail_pil(
+                        job,
+                        input_bytes,
+                    )
+                    event_type = "stage1_thumbnail_pil_timing"
+
+                self._emit_event(job.job_id, {"type": event_type, **stage1_timings})
 
                 upload = self._convex.upload_file_to_convex(
                     file_path=str(result_path),
@@ -1593,6 +1661,14 @@ class ConvexPullWorker:
                     "mimeType": "image/jpeg",
                     "resultWidth": result_w,
                     "resultHeight": result_h,
+                    "caseColorModeTask": color_mode_task,
+                    "convertedToRgb": is_rgb_conversion,
+                    "sourceColorMode": stage1_timings.get("sourceColorMode"),
+                    "sourceColorBands": stage1_timings.get("sourceColorBands"),
+                    "sourceIsCmyk": stage1_timings.get("sourceIsCmyk"),
+                    "sourceHasIccProfile": stage1_timings.get("sourceHasIccProfile"),
+                    "sourceOriginalWidth": stage1_timings.get("sourceOriginalWidth"),
+                    "sourceOriginalHeight": stage1_timings.get("sourceOriginalHeight"),
                     "timings": stage1_timings,
                 }
 
@@ -1610,6 +1686,9 @@ class ConvexPullWorker:
                         "resultWidth": result_w,
                         "resultHeight": result_h,
                         "processor": "pil",
+                        "caseColorModeTask": color_mode_task,
+                        "sourceColorMode": stage1_timings.get("sourceColorMode"),
+                        "sourceIsCmyk": stage1_timings.get("sourceIsCmyk"),
                     },
                 )
                 return
