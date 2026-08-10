@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import requests
@@ -38,6 +40,9 @@ class ConvexBridge:
     def __init__(self, cfg: ConvexConfig) -> None:
         self._cfg = cfg
         self._client: ConvexClient | None = None
+        self._inflight_lock = threading.Lock()
+        self._inflight_calls: dict[int, dict[str, Any]] = {}
+        self._next_call_id = 0
 
         if not cfg.convex_url:
             return
@@ -57,12 +62,39 @@ class ConvexBridge:
     def mutation(self, path: str, args: dict[str, Any]) -> Any:
         if not self._client:
             raise RuntimeError("Convex is not configured. Set CONVEX_URL first.")
-        return self._client.mutation(path, args)
+        return self._run_tracked_call("mutation", path, self._client.mutation, args)
 
     def query(self, path: str, args: dict[str, Any]) -> Any:
         if not self._client:
             raise RuntimeError("Convex is not configured. Set CONVEX_URL first.")
-        return self._client.query(path, args)
+        return self._run_tracked_call("query", path, self._client.query, args)
+
+    def _run_tracked_call(
+        self,
+        call_type: str,
+        path: str,
+        callback: Any,
+        args: dict[str, Any],
+    ) -> Any:
+        with self._inflight_lock:
+            self._next_call_id += 1
+            call_id = self._next_call_id
+            self._inflight_calls[call_id] = {
+                "callId": call_id,
+                "callType": call_type,
+                "path": path,
+                "startedAt": time.monotonic(),
+                "threadName": threading.current_thread().name,
+            }
+        try:
+            return callback(path, args)
+        finally:
+            with self._inflight_lock:
+                self._inflight_calls.pop(call_id, None)
+
+    def get_inflight_calls(self) -> list[dict[str, Any]]:
+        with self._inflight_lock:
+            return [dict(call) for call in self._inflight_calls.values()]
 
     def claim_next_pending_job(self, claim_mutation: str, worker_id: str) -> ClaimedJob | None:
         body = self.mutation(claim_mutation, {"workerId": worker_id})
@@ -217,7 +249,7 @@ class ConvexBridge:
         if save_metadata_mutation:
             payload = dict(save_payload or {})
             payload["storageId"] = storage_id
-            mutation_result = self._client.mutation(save_metadata_mutation, payload)
+            mutation_result = self.mutation(save_metadata_mutation, payload)
 
         return {
             "storageId": storage_id,

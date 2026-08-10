@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import copy
 import random
 import time
 import base64
 import threading
+from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from io import BytesIO
@@ -42,6 +44,8 @@ QWEN_COMFY_2511_LIGHTNING_LORA_NAME = "Qwen-Image-Edit-2511-Lightning-8steps-V1.
 
 class ConvexPullWorker:
     _THUMB_MAX_SIZE = 600
+    _CONVEX_STUCK_AFTER_SECONDS = 30.0
+    _WATCHDOG_INTERVAL_SECONDS = 10.0
     _CRITICAL_COMFY_WS_TYPES = {
         "execution_start",
         "execution_success",
@@ -52,6 +56,7 @@ class ConvexPullWorker:
     }
 
     def __init__(self) -> None:
+        self._logger = self._build_logger()
         self._convex = ConvexBridge(
             ConvexConfig(
                 convex_url=settings.convex_url,
@@ -74,9 +79,58 @@ class ConvexPullWorker:
         self._ws_event_counters: dict[str, int] = {}
         self._running = False
         self._heartbeat_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        self._reported_stuck_calls: dict[int, dict[str, Any]] = {}
+        self._heartbeat_thread_failure_reported = False
         self._heartbeat_lock = threading.Lock()
         self._current_job_id: str | None = None
         self._current_workflow_key: str | None = None
+
+    @staticmethod
+    def _build_logger() -> logging.Logger:
+        logger = logging.getLogger(f"comfy-worker.{settings.worker_id}")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if logger.handlers:
+            return logger
+
+        formatter = logging.Formatter(
+            "%(asctime)sZ %(levelname)s workerId=%(worker_id)s thread=%(threadName)s %(message)s"
+        )
+        formatter.converter = time.gmtime
+
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        try:
+            log_dir = Path(settings.output_dir) / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            safe_worker_id = "".join(
+                character if character.isalnum() or character in "-_" else "_"
+                for character in settings.worker_id
+            )
+            file_handler = RotatingFileHandler(
+                log_dir / f"{safe_worker_id}.log",
+                maxBytes=2 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "local_log_file_unavailable errorType=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+                extra={"worker_id": settings.worker_id},
+            )
+
+        return logger
+
+    def _log(self, level: int, message: str, *args: Any, **kwargs: Any) -> None:
+        kwargs["extra"] = {"worker_id": settings.worker_id}
+        self._logger.log(level, message, *args, **kwargs)
 
     def _purge_source_cache(self, now: float) -> None:
         ttl = max(settings.worker_source_cache_ttl_seconds, 0)
@@ -1267,13 +1321,14 @@ class ConvexPullWorker:
 
         self._running = True
         self._start_heartbeat_thread()
-        print(
-            "[worker] started",
-            {
-                "workerId": settings.worker_id,
-                "pollIntervalSeconds": settings.worker_poll_interval_seconds,
-                "claimMutation": settings.convex_claim_job_mutation,
-            },
+        self._start_watchdog_thread()
+        self._log(
+            logging.INFO,
+            "worker_started pollIntervalSeconds=%s heartbeatIntervalSeconds=%s claimMutation=%s logFile=%s",
+            settings.worker_poll_interval_seconds,
+            settings.worker_heartbeat_interval_seconds,
+            settings.convex_claim_job_mutation,
+            str(Path(settings.output_dir) / "logs" / f"{settings.worker_id}.log"),
         )
 
         while self._running:
@@ -1292,10 +1347,17 @@ class ConvexPullWorker:
                 self._running = False
                 break
             except Exception as exc:  # noqa: BLE001
-                print(f"[worker] loop error: {exc}")
+                self._log(
+                    logging.ERROR,
+                    "worker_loop_error errorType=%s error=%s",
+                    exc.__class__.__name__,
+                    exc,
+                    exc_info=True,
+                )
                 time.sleep(max(settings.worker_poll_interval_seconds, 1.0))
 
         self._send_heartbeat(status="offline", force=True)
+        self._log(logging.INFO, "worker_stopped")
 
     def stop(self) -> None:
         self._running = False
@@ -1317,6 +1379,118 @@ class ConvexPullWorker:
         while self._running:
             time.sleep(interval)
             self._send_heartbeat()
+
+    def _start_watchdog_thread(self) -> None:
+        if self._watchdog_thread and self._watchdog_thread.is_alive():
+            return
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name=f"{settings.worker_id}-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self) -> None:
+        while self._running:
+            time.sleep(self._WATCHDOG_INTERVAL_SECONDS)
+            try:
+                self._check_worker_health()
+            except Exception as exc:  # noqa: BLE001
+                self._log(
+                    logging.ERROR,
+                    "watchdog_error errorType=%s error=%s",
+                    exc.__class__.__name__,
+                    exc,
+                )
+
+    def _check_worker_health(self) -> None:
+        heartbeat_thread = self._heartbeat_thread
+        if (
+            heartbeat_thread is not None
+            and not heartbeat_thread.is_alive()
+            and not self._heartbeat_thread_failure_reported
+        ):
+            self._heartbeat_thread_failure_reported = True
+            self._log(logging.ERROR, "heartbeat_thread_stopped_unexpectedly")
+
+        now = time.monotonic()
+        newly_stuck = []
+        active_call_ids = set()
+        for call in self._convex.get_inflight_calls():
+            call_id = int(call["callId"])
+            active_call_ids.add(call_id)
+            elapsed = now - float(call["startedAt"])
+            if (
+                elapsed >= self._CONVEX_STUCK_AFTER_SECONDS
+                and call_id not in self._reported_stuck_calls
+            ):
+                self._reported_stuck_calls[call_id] = dict(call)
+                newly_stuck.append((call, elapsed))
+
+        recovered_call_ids = set(self._reported_stuck_calls) - active_call_ids
+        for call_id in recovered_call_ids:
+            call = self._reported_stuck_calls.pop(call_id)
+            self._log(
+                logging.INFO,
+                "convex_call_recovered callId=%s callType=%s path=%s",
+                call_id,
+                call["callType"],
+                call["path"],
+            )
+        if not newly_stuck:
+            return
+
+        for call, elapsed in newly_stuck:
+            self._log(
+                logging.WARNING,
+                "convex_call_stuck callId=%s callType=%s path=%s elapsedSeconds=%.1f callerThread=%s",
+                call["callId"],
+                call["callType"],
+                call["path"],
+                elapsed,
+                call["threadName"],
+            )
+        self._probe_convex_http()
+
+    def _probe_convex_http(self) -> None:
+        if not settings.convex_url:
+            return
+        started_at = time.monotonic()
+        try:
+            response = requests.post(
+                f"{settings.convex_url.rstrip('/')}/api/query",
+                json={
+                    "path": "comfyJobs:getWorkerAvailability",
+                    "args": {},
+                    "format": "json",
+                },
+                timeout=10,
+            )
+            convex_status = "unknown"
+            error_code = "none"
+            try:
+                response_body = response.json()
+                if isinstance(response_body, dict):
+                    convex_status = str(response_body.get("status", "unknown"))
+                    error_code = str(response_body.get("code", "none"))
+            except ValueError:
+                pass
+            self._log(
+                logging.WARNING,
+                "convex_http_probe_completed statusCode=%s convexStatus=%s errorCode=%s durationSeconds=%.2f",
+                response.status_code,
+                convex_status,
+                error_code,
+                time.monotonic() - started_at,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(
+                logging.ERROR,
+                "convex_http_probe_failed durationSeconds=%.2f errorType=%s error=%s",
+                time.monotonic() - started_at,
+                exc.__class__.__name__,
+                exc,
+            )
 
     def _send_heartbeat(self, status: str | None = None, force: bool = False) -> None:
         if not self._convex.enabled:
@@ -1341,7 +1515,13 @@ class ConvexPullWorker:
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[worker] heartbeat failed: {exc}")
+            self._log(
+                logging.ERROR,
+                "heartbeat_failed errorType=%s error=%s",
+                exc.__class__.__name__,
+                exc,
+                exc_info=True,
+            )
 
     def _emit_event(self, job_id: str, event: dict[str, Any]) -> None:
         payload = dict(event)
